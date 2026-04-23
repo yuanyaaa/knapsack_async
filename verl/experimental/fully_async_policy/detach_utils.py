@@ -15,12 +15,14 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from math import gcd
 from typing import Any, Optional
 
 import numpy as np
 import torch
 
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
@@ -122,7 +124,7 @@ def addition_process(output: DataProto):
 
 
 def assemble_batch_from_rollout_samples(
-    rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
+    rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None, actor_world_size: int = 1
 ) -> DataProto:
     """
     Assemble gen_batch_output from RolloutSample objects
@@ -133,6 +135,8 @@ def assemble_batch_from_rollout_samples(
         tokenizer: Tokenizer instance
         config: Configuration object containing trainer settings
         balance_batch: Whether to balance the batch (simplified version)
+        actor_world_size: Actor world size used to compute padding divisor
+            ``lcm(ppo_mini_batch_size, actor_world_size)``.
 
     Returns:
         DataProto: Assembled gen_batch_output
@@ -160,6 +164,33 @@ def assemble_batch_from_rollout_samples(
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():
         final_batch.batch["response_mask"] = compute_response_mask(final_batch)
+
+    # Pad assembled batch to satisfy both ppo_mini_batch_size and actor world size.
+    # This must happen before optional balance_batch; otherwise variable-size
+    # fixed_samples batches may fail early on divisibility assertions.
+    mbs = int(config.actor_rollout_ref.actor.ppo_mini_batch_size)
+    world_size = int(actor_world_size or 1)
+    divisor = mbs * world_size // gcd(mbs, world_size) if mbs > 0 and world_size > 0 else max(mbs, 1)
+    pre_pad_len = len(final_batch)
+    if divisor > 1 and pre_pad_len % divisor != 0:
+        _saved_meta = {}
+        for k in list(final_batch.meta_info.keys()):
+            v = final_batch.meta_info[k]
+            if isinstance(v, (list, np.ndarray)):
+                _saved_meta[k] = final_batch.meta_info.pop(k)
+        final_batch, pad_size = pad_dataproto_to_divisor(final_batch, divisor)
+        final_batch.meta_info.update(_saved_meta)
+        if pad_size > 0 and "response_mask" in final_batch.batch.keys():
+            response_mask = final_batch.batch["response_mask"]
+            response_mask[-pad_size:] = torch.zeros_like(response_mask[-pad_size:])
+            final_batch.batch["response_mask"] = response_mask
+        final_batch.meta_info["fully_async/pad/pre_pad_sequences"] = pre_pad_len
+        final_batch.meta_info["fully_async/pad/pad_size"] = int(pad_size)
+        final_batch.meta_info["fully_async/pad/divisor"] = int(divisor)
+    else:
+        final_batch.meta_info["fully_async/pad/pre_pad_sequences"] = pre_pad_len
+        final_batch.meta_info["fully_async/pad/pad_size"] = 0
+        final_batch.meta_info["fully_async/pad/divisor"] = int(divisor)
 
     if balance_batch:
         balance_batch(final_batch, metrics={})

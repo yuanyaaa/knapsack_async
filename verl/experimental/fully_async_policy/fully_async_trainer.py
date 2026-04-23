@@ -18,7 +18,6 @@ import logging
 import os
 import time
 from datetime import datetime
-from math import gcd
 from pprint import pprint
 from typing import Any
 
@@ -371,64 +370,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
 
         # Assemble batch - now working directly with RolloutSample objects
+        _actor_world_size = int(getattr(self.actor_wg, "world_size", 1) or 1)
         if self.config.trainer.balance_batch:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        else:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
-
-        batch.meta_info["fully_async/total_wait_time"] = total_wait_time
-
-        # ------------------------------------------------------------------
-        # Pad the assembled batch to a multiple of ppo_mini_batch_size.
-        # Under fixed_samples / max_rollout_n / has_at_least_positive rules,
-        # the total sequence count is VARIABLE and may not divide mbs. We pad
-        # with copies of existing rows but ZERO OUT their response_mask so they
-        # contribute no loss / no gradient.
-        # We also align with actor_wg.world_size to satisfy the downstream
-        # DataProto iterator assertion (total % world_size == 0).
-        # ------------------------------------------------------------------
-        mbs = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
-        world_size = int(getattr(self.actor_wg, "world_size", 1) or 1)
-        # lcm(mbs, world_size)
-        divisor = mbs * world_size // gcd(mbs, world_size) if mbs > 0 and world_size > 0 else max(mbs, 1)
-
-        pre_pad_len = len(batch)
-        if divisor > 1 and pre_pad_len % divisor != 0:
-            # Temporarily remove list/array meta_info keys that cannot survive
-            # DataProto.concat's ``assert merged_meta_info[k] == v`` check
-            # (numpy array equality returns an array, not a bool).
-            _saved_meta = {}
-            for k in list(batch.meta_info.keys()):
-                v = batch.meta_info[k]
-                if isinstance(v, (list, np.ndarray)):
-                    _saved_meta[k] = batch.meta_info.pop(k)
-            batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
-            # Restore the saved list/array meta_info keys
-            batch.meta_info.update(_saved_meta)
-            # Zero-out response_mask (and attention_mask beyond prompts if present)
-            # for the appended pad rows so they produce no loss / no gradient.
-            if pad_size > 0 and "response_mask" in batch.batch.keys():
-                response_mask = batch.batch["response_mask"]
-                response_mask[-pad_size:] = torch.zeros_like(response_mask[-pad_size:])
-                batch.batch["response_mask"] = response_mask
-            batch.meta_info["fully_async/pad/pre_pad_sequences"] = pre_pad_len
-            batch.meta_info["fully_async/pad/pad_size"] = int(pad_size)
-            batch.meta_info["fully_async/pad/divisor"] = int(divisor)
-            print(
-                f"[FullyAsyncTrainer] Padded batch from {pre_pad_len} to {len(batch)} "
-                f"(pad={pad_size}, divisor=lcm(mbs={mbs}, world_size={world_size})={divisor}). "
-                f"response_mask of pad rows set to 0."
+            batch = assemble_batch_from_rollout_samples(
+                queue_samples, self.tokenizer, self.config, self._balance_batch, actor_world_size=_actor_world_size
             )
         else:
-            batch.meta_info["fully_async/pad/pre_pad_sequences"] = pre_pad_len
-            batch.meta_info["fully_async/pad/pad_size"] = 0
-            batch.meta_info["fully_async/pad/divisor"] = int(divisor)
+            batch = assemble_batch_from_rollout_samples(
+                queue_samples, self.tokenizer, self.config, None, actor_world_size=_actor_world_size
+            )
+
+        batch.meta_info["fully_async/total_wait_time"] = total_wait_time
 
         # ------------------------------------------------------------------
         # Fetch rejection-sampling stats + reward_info accumulated on the rollouter
         # since the last training step. This keeps raw_acc / unweighted_acc honest
         # even though the trainer never sees the rejected samples.
         # ------------------------------------------------------------------
+
         if self.rejection_sampling_enabled:
             try:
                 rej_info = await asyncio.wrap_future(
