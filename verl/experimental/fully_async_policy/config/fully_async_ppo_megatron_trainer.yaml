@@ -1,0 +1,99 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_megatron_trainer
+  - _self_
+
+trainer:
+  use_legacy_worker_impl: disable
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, AsyncLLMServerManager auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+  # ==================== Rollout Config (streaming per-sequence) ====================
+  # Async rollout is always streaming per-sequence: per-prompt stop rules decide
+  # when to stop generating more sequences. The classic "every prompt rollout N
+  # times" mode == stop_rule=fixed_rollout (with N = actor_rollout_ref.rollout.n,
+  # i.e. the GRPO group size; there is no separate fixed_rollout_n knob by design).
+  # When ``adaptive_rollout_n_strategy`` is set to a non-null strategy name AND
+  # stop_rule=fixed_rollout, the per-prompt N is computed dynamically from
+  # pass_rate via that strategy (see utils/async_prompt_buffer.py registry).
+  rollout_config:
+    working_pool_size: null
+    stop_rule: "fixed_rollout"            # fixed_rollout | prefixed_rollout |
+                                          # has_at_least_positive |
+                                          # has_at_least_positive_and_negative |
+                                          # max_rollout
+    max_rollout_n: 32
+    # adaptive-n strategy registry key. null -> disabled (use static rollout.n
+    # as the per-prompt N). Built-ins:
+    #   medium_focus       bell-shaped, peak at p=0.5 (original behavior)
+    #   constant_positive  n = base_n / max(p, 1/max_n); keeps E[#positives] ~ base_n
+    #   uniform            ignore pass_rate and return base_n (debug / ablation)
+    adaptive_rollout_n_strategy: null
+    # Lower clamp on adaptive rollout_n; upper clamp is ``max_rollout_n`` above.
+    min_rollout_n: 2
+    train_trigger: "fixed_prompt"         # fixed_prompt | fixed_samples
+    # null -> default = required_samples (= ppo_mini_batch_size * rollout.n * require_batches)
+    target_samples: null
+    rejection_sampling: False             # drop solve_all / solve_none on rollouter side
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True

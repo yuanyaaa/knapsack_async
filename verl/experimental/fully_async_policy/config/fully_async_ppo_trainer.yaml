@@ -1,0 +1,188 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+trainer:
+  use_legacy_worker_impl: disable
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
+  # If True, AsyncLLMServerManager auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+  # ==================== Prompt Buffer (Priority Sampling + Adaptive Rollout N) ====================
+  # AsyncPromptBuffer is always used. When priority_strategy is null and
+  # adaptive_rollout_n_strategy is null, it degrades to uniform random sampling
+  # with fixed rollout_n, equivalent to the original dataloader behavior.
+
+  # Priority sampling strategy. Supported: "medium", "hard", "medium_with_exploration".
+  # Set to null to disable priority weighting (uniform sampling, default).
+  priority_strategy: null
+
+  # EMA coefficient for pass-rate updates. 0.0 means always overwrite with latest pass_rate.
+  reward_ema: 0.0
+
+  # Clip updated pass_rate into [pass_rate_clip_min, pass_rate_clip_max]. Useful when
+  # reward_ema is small: prevents pass_rate from collapsing to exactly 0 / 1 (which
+  # zeros out priority weights under e.g. the 'medium' strategy) and keeps every prompt
+  # reachable by the sampler. Defaults to [0.01, 0.99].
+  pass_rate_clip_min: 0.01
+  pass_rate_clip_max: 0.99
+
+  # Random seed for prompt buffer sampling reproducibility.
+  prompt_buffer_seed: 42
+
+  # ==================== Rollout Config (streaming per-sequence) ====================
+  # Async rollout is always streaming per-sequence: submit sequence generation jobs
+  # ONE AT A TIME per prompt_uid, then decide (after each job returns) whether to
+  # keep generating more sequences for that prompt or to stop and emit a single
+  # RolloutSample bundling all sequences of that prompt.
+  #
+  # The classic "every prompt rollout N times" mode is simply:
+  #   stop_rule=fixed_rollout  (with N = actor_rollout_ref.rollout.n)
+  # and is fully supported by this path.
+  #
+  # NOTE: when ``adaptive_rollout_n_strategy`` (inside rollout_config) is set
+  # to a non-null strategy name AND stop_rule=fixed_rollout, the per-prompt
+  # threshold is dynamically computed from pass_rate via that strategy,
+    # clipped to [min_rollout_n, max_rollout_n]. The upper clamp is
+  # intentionally shared with the buffer-level ``max_rollout_n`` (single
+  # source of truth) instead of a separate adaptive-only knob.
+  rollout_config:
+    # Number of unique prompt_uids that are simultaneously being served in the
+    # working pool. null -> default = ppo_mini_batch_size * require_batches.
+    working_pool_size: null
+
+    # Per-prompt stop rule. One of:
+    #   fixed_rollout                          stop when finished >= actor_rollout_ref.rollout.n
+    #                                          (or adaptive N via
+    #                                           adaptive_rollout_n_strategy when set)
+    #   prefixed_rollout                       stop when finished >= ceil(1/sampling_prob)
+    #   has_at_least_positive                  stop when there is >= 1 positive reward
+    #   has_at_least_positive_and_negative     stop when there is >= 1 pos AND >= 1 neg
+    #   max_rollout                            stop when finished >= max_rollout_n
+    stop_rule: "fixed_rollout"
+
+    # NOTE: the static threshold for fixed_rollout is locked to
+    # ``actor_rollout_ref.rollout.n`` (= GRPO group size). There is no separate
+    # ``fixed_rollout_n`` knob on purpose: decoupling the two would silently
+    # break the "one emitted RolloutSample == one complete GRPO group" contract.
+
+    # Global hard cap on # sequences per prompt. Applied by every stop_rule
+    # (prevents unbounded sequence count for pathological prompts under e.g.
+    # has_at_least_positive), AND reused as the upper clamp of adaptive
+    # strategies when adaptive_rollout_n_strategy is set.
+    max_rollout_n: 32
+
+    # Adaptive rollout_n strategy. Single switch: set to a non-null strategy
+    # name to enable the pass_rate -> N mapping (only effective when
+    # stop_rule=fixed_rollout; overrides the static rollout.n threshold on a
+    # per-prompt basis). Set to null to disable and fall back to rollout.n.
+    #
+    # Built-ins registered in utils/async_prompt_buffer.py:
+    #   medium_focus        bell-shaped: peak at pass_rate≈0.5, low at 0/1.
+    #                       Rationale: Bernoulli variance p(1-p) is maximal at
+    #                       0.5, so middle-difficulty prompts carry the most
+    #                       learning signal per rollout. (matches the original
+    #                       bell-shaped behavior)
+    #   constant_positive   n = round(base_n / max(p, 1/max_n)). Keeps the
+    #                       EXPECTED number of positive rollouts ~= base_n
+    #                       across difficulty levels; hard prompts (small p)
+    #                       get heavily upsampled (capped by max_n).
+    #   uniform             ignore pass_rate and always return base_n (debug /
+    #                       ablation switch).
+    # Users can register additional strategies via the @register_adaptive_n
+    # decorator.
+    adaptive_rollout_n_strategy: null
+
+    # Lower clamp on adaptive rollout_n (only used when
+    # adaptive_rollout_n_strategy is not null). The upper clamp is
+    # ``max_rollout_n`` above -- no separate knob.
+    min_rollout_n: 2
+
+    # Training-trigger rule. One of:
+    #   fixed_prompt       trigger when number of completed prompt_uids reaches a threshold
+    #                      (defaults to required_samples, so trainer-side behavior is unchanged)
+    #   fixed_samples      trigger when total completed samples reaches a threshold
+    train_trigger: "fixed_prompt"
+
+    # Threshold for fixed_samples rule. null -> default = required_samples
+    # (= ppo_mini_batch_size * rollout.n * require_batches), which is already a
+    # sample-level count; do NOT multiply by rollout.n again.
+    target_samples: null
+
+    # Rejection sampling. When True, the ROLLOUTER filters out samples where
+    # all responses of a prompt have identical rewards (all correct or all
+    # incorrect), as they provide no useful gradient signal. Rejected samples
+    # are NOT sent to the trainer queue; the rollouter keeps accounting so
+    # raw_acc / unweighted_acc still reflect the true population on the trainer side.
+    rejection_sampling: False
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    checkpoint_engine:
+      backend: "nccl"
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True
+
+  # When True, zero out response_mask for GRPO groups whose sequence-level rewards
+  # have zero intra-group variance (i.e. advantage will be 0 for all their tokens).
+  # These "dead" samples still run forward (batch shape preserved) but contribute
+  # neither to pg/entropy/KL loss denominators nor to actor backward gradients,
+  # making the loss mask honest and removing dilution of the learning signal.
+  # Applied right after rollouter samples are received, before log_prob / actor forward.
+  filter_zero_adv: False
