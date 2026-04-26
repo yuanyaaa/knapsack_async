@@ -651,7 +651,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # at the cost of still running forward for the masked rows (no drop).
             if self.config.algorithm.adv_estimator == "grpo_filter":
                 with marked_timer("filter_zero_adv", timing_raw, color="grey"):
-                    filter_metrics = mask_out_zero_variance_groups(batch, self.logger)
+                    filter_metrics = mask_out_zero_variance_groups(batch)
                     metrics.update(filter_metrics)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch

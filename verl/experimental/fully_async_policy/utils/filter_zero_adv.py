@@ -51,7 +51,7 @@ __all__ = ["mask_out_zero_variance_groups", "compute_grpo_advantage_exclude_pad"
 _STD_EPS = 1e-8
 
 
-def mask_out_zero_variance_groups(batch: DataProto, logger: logging.Logger) -> dict[str, Any]:
+def mask_out_zero_variance_groups(batch: DataProto) -> dict[str, Any]:
     """Zero out ``response_mask`` for GRPO groups with zero reward variance.
 
     NOTE: This is the core primitive of the ``algorithm.filter_zero_adv``
@@ -66,8 +66,6 @@ def mask_out_zero_variance_groups(batch: DataProto, logger: logging.Logger) -> d
             ``[B, response_length]``), ``batch["response_mask"]``
             (shape ``[B, response_length]``), and
             ``non_tensor_batch["uid"]`` (length-B object array of group ids).
-        logger: Logger used to emit a brief per-step summary.
-
     Returns:
         Dict of metrics to be merged into step metrics, all prefixed with
         ``fully_async/filter_zero_adv/``.
@@ -80,17 +78,17 @@ def mask_out_zero_variance_groups(batch: DataProto, logger: logging.Logger) -> d
 
     # ------------- 1. Pre-conditions ---------------------------------------
     if "rm_scores" not in batch.batch:
-        logger.warning(
+        logging.warning(
             "[filter_zero_adv] 'rm_scores' not in batch; skipping "
             "(filter_zero_adv requires rollouter-provided reward)."
         )
         return metrics
     if "response_mask" not in batch.batch:
-        logger.warning("[filter_zero_adv] 'response_mask' not in batch; skipping.")
+        logging.warning("[filter_zero_adv] 'response_mask' not in batch; skipping.")
         return metrics
     uids = batch.non_tensor_batch.get("uid", None)
     if uids is None:
-        logger.warning("[filter_zero_adv] 'uid' not in non_tensor_batch; skipping.")
+        logging.warning("[filter_zero_adv] 'uid' not in non_tensor_batch; skipping.")
         return metrics
 
     response_mask: torch.Tensor = batch.batch["response_mask"]  # [B, L]
@@ -166,7 +164,7 @@ def mask_out_zero_variance_groups(batch: DataProto, logger: logging.Logger) -> d
     # downstream loss would be NaN. We only warn here (not raise), because
     # this can legitimately happen on cold-start / reward-saturated stages.
     if valid_tokens_after == 0 and valid_tokens_before > 0:
-        logger.warning(
+        logging.warning(
             "[filter_zero_adv] ALL response_mask tokens were filtered out; "
             "downstream loss will see an empty denominator. Consider disabling "
             "filter_zero_adv or raising rollout.n."
