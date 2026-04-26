@@ -165,12 +165,20 @@ def assemble_batch_from_rollout_samples(
     if "response_mask" not in final_batch.batch.keys():
         final_batch.batch["response_mask"] = compute_response_mask(final_batch)
 
-    # Pad assembled batch to satisfy both ppo_mini_batch_size and actor world size.
+    # Pad assembled batch to satisfy actor update mini-batch divisibility.
+    # Actor side uses `ppo_mini_batch_size * rollout.n` (sequence-level) as the
+    # global mini-batch size, so we align with that and world size together.
     # This must happen before optional balance_batch; otherwise variable-size
     # fixed_samples batches may fail early on divisibility assertions.
     mbs = int(config.actor_rollout_ref.actor.ppo_mini_batch_size)
+    rollout_n = int(config.actor_rollout_ref.rollout.n)
     world_size = int(actor_world_size or 1)
-    divisor = mbs * world_size // gcd(mbs, world_size) if mbs > 0 and world_size > 0 else max(mbs, 1)
+    mbs_seq = mbs * rollout_n if mbs > 0 and rollout_n > 0 else max(mbs, 1)
+    divisor = (
+        mbs_seq * world_size // gcd(mbs_seq, world_size)
+        if mbs_seq > 0 and world_size > 0
+        else max(mbs_seq, 1)
+    )
     pre_pad_len = len(final_batch)
     if divisor > 1 and pre_pad_len % divisor != 0:
         _saved_meta = {}
