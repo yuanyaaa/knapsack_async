@@ -81,8 +81,8 @@ total_rollout_steps=$(((ppo_train_bsz * n_resp_per_prompt * max_training_steps))
 test_freq=20
 partial_rollout=True
 
-# ==================== Priority Sampling ====================
-priority_strategy="medium_sharp"  # "medium", "hard", "medium_with_exploration", or null
+# ==================== Prompt sample strategy ====================
+sample_strategy="medium_sharp"  # sequential|null | uniform | medium | hard | medium_with_exploration | ...
 reward_ema=0.1  # EMA coefficient for pass-rate (0.0 = overwrite)
 
 # ==================== Rollout Config ====================
@@ -201,7 +201,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.reward_ema="${reward_ema}" \
-    async_training.priority_strategy="${priority_strategy}" \
+    async_training.sample_strategy="${sample_strategy}" \
     async_training.rollout_config.stop_rule="${stop_rule}" \
     async_training.rollout_config.min_rollout_n="${min_rollout_n}" \
     async_training.rollout_config.max_rollout_n="${max_rollout_n}" \
