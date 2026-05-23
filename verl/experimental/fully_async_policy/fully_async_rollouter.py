@@ -25,7 +25,11 @@ import numpy as np
 import ray
 import torch
 
-from verl.experimental.fully_async_policy.utils.async_prompt_buffer import AsyncPromptBuffer, get_adaptive_rollout_n
+from verl.experimental.fully_async_policy.utils.async_prompt_buffer import (
+    AsyncPromptBuffer,
+    get_adaptive_rollout_n,
+    resolve_prompt_sample_strategy,
+)
 from verl.experimental.fully_async_policy.utils.async_response_buffer import (
     TRAIN_TRIGGER_FIXED_PROMPT,
     TRAIN_TRIGGER_FIXED_SAMPLES,
@@ -138,24 +142,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         # ==================== AsyncPromptBuffer ====================
-        # Always create AsyncPromptBuffer. When priority_strategy=None it
-        # degrades to uniform random sampling, equivalent to the original
-        # dataloader behavior.
+        # Always create AsyncPromptBuffer. ``sample_strategy`` is resolved in
+        # ``resolve_prompt_sample_strategy`` (optional legacy ``priority_strategy`` in config):
+        # sequential (default), uniform random, or pass_rate-weighted priority.
         #
         # NOTE: "rollout n per prompt" is decided by the rollouter side
         # (AsyncResponseBuffer + optional dynamic_fixed_n_provider reading
         # pass_rate from prompt_buffer.meta_data). Those knobs live in
         # ``async_training.rollout_config.*`` and are NOT forwarded here.
         async_training_cfg = config.async_training
-        priority_strategy = async_training_cfg.get("priority_strategy", None)
+        sample_strategy = resolve_prompt_sample_strategy(async_training_cfg)
         self.prompt_buffer = AsyncPromptBuffer(
             dataset=train_dataset,
             collate_fn=collate_fn,
             seed=async_training_cfg.get("prompt_buffer_seed", 42),
-            priority_strategy=priority_strategy,
+            sample_strategy=sample_strategy,
             reward_ema=async_training_cfg.get("reward_ema", 0.0),
             pass_rate_clip_min=async_training_cfg.get("pass_rate_clip_min", 0.01),
             pass_rate_clip_max=async_training_cfg.get("pass_rate_clip_max", 0.99),
+            uniform_extreme_alpha=async_training_cfg.get("uniform_extreme_alpha", 0.2),
+            uniform_ucb_c=async_training_cfg.get("uniform_ucb_c", 0.0),
         )
         print("[FullyAsyncRollouter] AsyncPromptBuffer created successfully")
 
@@ -366,10 +372,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"per-prompt N will be computed dynamically from pass_rate."
             )
 
+        _min_positive_k = (
+            int(rollout_cfg.get("min_rollout_n", 1))
+            if stop_rule == "has_at_least_positive"
+            else 1
+        )
         self.response_buffer: AsyncResponseBuffer = AsyncResponseBuffer(
             stop_rule=stop_rule,
             fixed_rollout_n=_base_n,
             max_rollout_n=_hard_max_n,
+            min_positive_k=_min_positive_k,
             train_trigger=rollout_cfg.get("train_trigger", TRAIN_TRIGGER_FIXED_PROMPT),
             dynamic_fixed_n_provider=dynamic_provider,
         )
@@ -1233,6 +1245,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         }
 
         stats.update(self.response_buffer.stats())
+        # Dataset-level prompt-buffer observability (e.g., cumulative unique seen prompts).
+        stats.update({
+            f"fully_async/{k}": v for k, v in self.prompt_buffer.get_dataset_info().items()
+        })
 
         # Rejection sampling live counters (cumulative since last consume).
         if self.rejection_sampling_enabled:

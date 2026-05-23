@@ -28,14 +28,23 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
-  # ==================== Prompt Buffer (Priority Sampling + Adaptive Rollout N) ====================
-  # AsyncPromptBuffer is always used. When priority_strategy is null and
-  # adaptive_rollout_n_strategy is null, it degrades to uniform random sampling
-  # with fixed rollout_n, equivalent to the original dataloader behavior.
+  # ==================== Prompt Buffer (Sample Strategy + Adaptive Rollout N) ====================
+  # AsyncPromptBuffer is always used. sample_strategy:
+  #   null | sequential — round-robin by dataset row index (default)
+  #   uniform            — uniform random row
+  #   uniform_extreme_ucb — weighted random row: uniform by default, p=0/p=1 rows
+  #                         are downweighted by uniform_extreme_alpha, and
+  #                         uniform_ucb_c optionally boosts low-count prompts
+  #   weight_sequential — row_weights = 0.5-|pass_rate-0.5|, traverse by descending weight;
+  #                       pass_rate 每步更新，row_weights 与顺序每「数据集一轮」结束刷新一次
+  #   medium | hard | medium_sharp | medium_with_exploration — pass_rate-weighted sampling
 
-  # Priority sampling strategy. Supported: "medium", "hard", "medium_with_exploration".
-  # Set to null to disable priority weighting (uniform sampling, default).
-  priority_strategy: null
+  sample_strategy: null
+
+  # Hyperparameters for sample_strategy=uniform_extreme_ucb.
+  # Same alpha is used for p=0 and p=1 endpoints.
+  uniform_extreme_alpha: 0.2
+  uniform_ucb_c: 0.0
 
   # EMA coefficient for pass-rate updates. 0.0 means always overwrite with latest pass_rate.
   reward_ema: 0.0
@@ -43,9 +52,10 @@ async_training:
   # Clip updated pass_rate into [pass_rate_clip_min, pass_rate_clip_max]. Useful when
   # reward_ema is small: prevents pass_rate from collapsing to exactly 0 / 1 (which
   # zeros out priority weights under e.g. the 'medium' strategy) and keeps every prompt
-  # reachable by the sampler. Defaults to [0.01, 0.99].
-  pass_rate_clip_min: 0.01
-  pass_rate_clip_max: 0.99
+  # reachable by the sampler. Defaults to [0.0, 0.99].
+  # TODO maybe harmful for medium priority sampling
+  pass_rate_clip_min: 0.00
+  pass_rate_clip_max: 1.00
 
   # Random seed for prompt buffer sampling reproducibility.
   prompt_buffer_seed: 42
@@ -76,7 +86,7 @@ async_training:
     #                                          (or adaptive N via
     #                                           adaptive_rollout_n_strategy when set)
     #   prefixed_rollout                       stop when finished >= ceil(1/sampling_prob)
-    #   has_at_least_positive                  stop when there is >= 1 positive reward
+    #   has_at_least_positive                  stop when #positive rewards >= min_rollout_n
     #   has_at_least_positive_and_negative     stop when there is >= 1 pos AND >= 1 neg
     #   max_rollout                            stop when finished >= max_rollout_n
     stop_rule: "fixed_rollout"
@@ -113,9 +123,9 @@ async_training:
     # decorator.
     adaptive_rollout_n_strategy: null
 
-    # Lower clamp on adaptive rollout_n (only used when
-    # adaptive_rollout_n_strategy is not null). The upper clamp is
-    # ``max_rollout_n`` above -- no separate knob.
+    # Lower clamp on adaptive rollout_n (when adaptive_rollout_n_strategy is set),
+    # OR the required #positive rewards k for stop_rule=has_at_least_positive.
+    # Upper clamp for adaptive strategies is ``max_rollout_n`` above.
     min_rollout_n: 2
 
     # Training-trigger rule. One of:

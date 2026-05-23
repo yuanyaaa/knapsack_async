@@ -16,7 +16,8 @@
 AsyncPromptBuffer - A prompt buffer designed for fully-async streaming rollout.
 
 Responsibilities:
-- Priority-based prompt selection (weighted by pass_rate)
+- Configurable prompt row sampling: sequential, uniform, pass_rate-ordered (weight_sequential),
+  or pass_rate-weighted priority
 - Per-prompt pass_rate / count tracking (updated after each rollout via on_sample_end)
 - Stateful checkpointing via state_dict() / load_state_dict()
 
@@ -24,8 +25,18 @@ Unlike the batch-oriented PromptBuffer in hytuner, this buffer is designed for
 single-sample streaming: each call to get_single_sample() returns one prompt,
 and on_sample_end() updates the buffer immediately after each rollout completes.
 
-When priority_strategy=None, the buffer degrades to uniform random sampling,
-which is functionally equivalent to the original StatefulDataLoader-based approach.
+Prompt **sample_strategy** (see ``resolve_prompt_sample_strategy``):
+
+- ``None`` / ``sequential``: iterate prompts in dataset order (round-robin).
+- ``uniform``: uniform random row sampling.
+- ``uniform_extreme_ucb``: uniform-like weighted sampling that only downweights
+  pass_rate endpoints (p=0 or p=1) by ``uniform_extreme_alpha`` and optionally
+  adds a UCB-style exploration multiplier controlled by ``uniform_ucb_c``.
+- ``weight_sequential``: reuses ``row_weights`` with ``0.5 - abs(pass_rate - 0.5)`` per row
+  (same buffer as priority; **sampling** is round-robin in descending ``row_weights`` order).
+  ``pass_rate`` updates every rollout; ``row_weights`` and traversal order refresh **once per
+  epoch** (after one full pass over all dataset rows in the current order).
+- Any registered priority name (e.g. ``medium_sharp``): weighted by ``pass_rate``.
 
 NOTE: "How many sequences to roll out for a given prompt" (including any
 adaptive pass_rate -> N heuristic) is NOT decided here. It is owned by the
@@ -44,6 +55,50 @@ import numpy as np
 import torch
 
 from verl.experimental.fully_async_policy.utils.priority_sampling import get_priority_weight_fn
+
+
+def pass_rate_to_weight_sequential_row_weight(pass_rate: float) -> float:
+    """Scalar written to ``row_weights`` for ``weight_sequential`` (same array as priority).
+
+    Uses ``0.5 - abs(p - 0.5)``: largest at ``p == 0.5``, zero at 0 and 1. Traversal order
+    is descending ``row_weights`` (then row index), same as ascending ``abs(p - 0.5)``.
+    """
+    p = float(pass_rate)
+    return float(0.5 - abs(p - 0.5))
+
+
+def resolve_prompt_sample_strategy(async_training_cfg) -> Optional[str]:
+    """Map ``async_training`` config to the buffer's logical ``sample_strategy`` value.
+
+    Returns:
+        ``None``: sequential (dataset order, round-robin).
+        ``\"uniform\"``: uniform random sampling over rows.
+        ``\"uniform_extreme_ucb\"``: weighted-random sampling that is uniform by
+        default, downweights p=0/p=1 prompts by ``uniform_extreme_alpha``, and
+        can add a UCB-style exploration multiplier via ``uniform_ucb_c``.
+        ``\"weight_sequential\"``: ordered traversal by distance of ``pass_rate`` from 0.5.
+        Any other non-empty string: registered priority weight strategy (e.g. ``medium_sharp``).
+
+    \"Off\" / sequential tokens for ``sample_strategy``: ``None``, ``\"\"``, ``\"null\"``,
+    ``\"none\"``, ``\"sequential\"`` (case-insensitive).
+    """
+    ss = async_training_cfg.get("sample_strategy", None)
+
+    def _sequential_off(x: Any) -> bool:
+        if x is None:
+            return True
+        if isinstance(x, str):
+            return x.strip().lower() in ("", "null", "none", "sequential")
+        return False
+
+    def _is_uniform(x: Any) -> bool:
+        return isinstance(x, str) and x.strip().lower() == "uniform"
+
+    if _is_uniform(ss):
+        return "uniform"
+    if not _sequential_off(ss) and ss is not None:
+        return str(ss).strip()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -177,16 +232,25 @@ def adaptive_rollout_n(pass_rate: float, base_n: int, min_n: int = 1, max_n: int
 
 class AsyncPromptBuffer:
     """
-    Async-friendly prompt buffer with priority sampling.
+    Async-friendly prompt buffer with configurable row sampling.
 
     Designed for fully-async streaming rollout where samples are processed one at
     a time. Maintains per-prompt metadata (pass_rate, count) that is updated
-    incrementally after each rollout completes, and exposes priority-weighted
-    single-prompt sampling.
+    incrementally after each rollout completes.
 
-    When ``priority_strategy=None``, the buffer degrades to uniform random
-    sampling, functionally equivalent to the original ``StatefulDataLoader``-based
-    approach and making this class a drop-in replacement.
+    ``sample_strategy`` controls how dataset rows are chosen:
+
+    - ``None`` (sequential off): round-robin in dataset index order.
+    - ``\"uniform\"``: uniform random row (optionally use ``resolve_prompt_sample_strategy``
+      from config, which may map legacy keys to this mode).
+    - ``\"uniform_extreme_ucb\"``: uniform-like weighted-random row sampling; p=0/p=1 rows
+      are downweighted by ``uniform_extreme_alpha`` and ``uniform_ucb_c`` adds optional
+      exploration for prompts with lower observed counts.
+    - ``\"weight_sequential\"``: fills ``row_weights`` from ``pass_rate`` (see
+      ``pass_rate_to_weight_sequential_row_weight``), then round-robin in descending
+      weight order. ``meta_data`` / ``pass_rate`` update every rollout; ``row_weights`` and
+      order rebuild only at **epoch** boundary (one full cycle through all rows).
+    - Any registered priority name: sample rows with weights from ``pass_rate``.
 
     NOTE: The number of sequences to roll out per prompt is **not** decided here.
     The rollouter-side ``AsyncResponseBuffer`` (together with an optional
@@ -200,10 +264,15 @@ class AsyncPromptBuffer:
         dataset: The dataset to sample from (must support __len__ and __getitem__).
         collate_fn: Function to collate a single sample into a batch dict.
         seed: Random seed for reproducibility.
-        priority_strategy: Priority weighting strategy name. None disables priority sampling.
+        sample_strategy: ``None`` = sequential; ``\"uniform\"`` = uniform random;
+            ``\"uniform_extreme_ucb\"`` = endpoint-penalized uniform with optional
+            UCB exploration; ``\"weight_sequential\"`` = sorted-by-pass_rate order;
+            else a registered priority weight strategy name.
         reward_ema: EMA coefficient for pass-rate updates. 0.0 means always overwrite.
         pass_rate_clip_min: Lower bound to clip updated pass_rate. Defaults to 0.0 (no clip).
         pass_rate_clip_max: Upper bound to clip updated pass_rate. Defaults to 1.0 (no clip).
+        uniform_extreme_alpha: Downweight factor for p=0/p=1 under ``uniform_extreme_ucb``.
+        uniform_ucb_c: Strength of UCB-style exploration multiplier under ``uniform_extreme_ucb``.
     """
 
     def __init__(
@@ -211,10 +280,12 @@ class AsyncPromptBuffer:
         dataset,
         collate_fn: Callable,
         seed: Optional[int] = None,
-        priority_strategy: Optional[str] = None,
+        sample_strategy: Optional[str] = None,
         reward_ema: float = 0.0,
         pass_rate_clip_min: float = 0.0,
         pass_rate_clip_max: float = 1.0,
+        uniform_extreme_alpha: float = 0.2,
+        uniform_ucb_c: float = 0.0,
     ):
         self.dataset = dataset
         self.collate_fn = collate_fn
@@ -225,10 +296,38 @@ class AsyncPromptBuffer:
         if seed is not None:
             self.generator.manual_seed(seed)
 
-        # Priority sampling setup
-        self.use_priority = priority_strategy is not None
-        self.priority_strategy = priority_strategy
-        self._priority_weight_fn = get_priority_weight_fn(priority_strategy) if self.use_priority else None
+        # --- sample_strategy: sequential | uniform | weight_sequential | priority ---
+        raw = sample_strategy
+        if raw is not None and isinstance(raw, str) and raw.strip().lower() in ("", "null", "none", "sequential"):
+            raw = None
+        self.sample_strategy = raw
+        if raw is None:
+            self._sample_mode = "sequential"
+            self._priority_key: Optional[str] = None
+            self._priority_weight_fn = None
+        elif isinstance(raw, str) and raw.strip().lower() == "uniform":
+            self._sample_mode = "uniform"
+            self._priority_key = None
+            self._priority_weight_fn = None
+        elif isinstance(raw, str) and raw.strip().lower() == "uniform_extreme_ucb":
+            self._sample_mode = "uniform_extreme_ucb"
+            self._priority_key = None
+            self._priority_weight_fn = None
+        elif isinstance(raw, str) and raw.strip().lower() == "weight_sequential":
+            self._sample_mode = "weight_sequential"
+            self._priority_key = None
+            self._priority_weight_fn = None
+        else:
+            key = str(raw).strip().lower()
+            self._sample_mode = "priority"
+            self._priority_key = key
+            self._priority_weight_fn = get_priority_weight_fn(key)
+
+        self.use_priority = self._sample_mode == "priority"
+        self.use_uniform_extreme_ucb = self._sample_mode == "uniform_extreme_ucb"
+
+        self._seq_cursor: int = 0
+        self._weight_sequential_order: list[int] = []
         self.alpha = reward_ema  # EMA coefficient: 0.0 means always overwrite
 
         # NOTE: Pass-rate clipping keeps updated pass_rate within [clip_min, clip_max].
@@ -242,15 +341,36 @@ class AsyncPromptBuffer:
             )
         self.pass_rate_clip_min = float(pass_rate_clip_min)
         self.pass_rate_clip_max = float(pass_rate_clip_max)
+        if not (0.0 <= uniform_extreme_alpha <= 1.0):
+            raise ValueError(
+                f"Invalid uniform_extreme_alpha: {uniform_extreme_alpha}. Must satisfy 0.0 <= alpha <= 1.0."
+            )
+        if uniform_ucb_c < 0.0:
+            raise ValueError(f"Invalid uniform_ucb_c: {uniform_ucb_c}. Must be non-negative.")
+        self.uniform_extreme_alpha = float(uniform_extreme_alpha)
+        self.uniform_ucb_c = float(uniform_ucb_c)
 
-        if self.use_priority:
+        if self._sample_mode == "priority":
             print(
-                f"[AsyncPromptBuffer] Priority sampling enabled with strategy='{priority_strategy}', "
+                f"[AsyncPromptBuffer] sample_strategy=priority ('{self._priority_key}'), "
                 f"reward_ema={reward_ema}, "
                 f"pass_rate_clip=[{self.pass_rate_clip_min}, {self.pass_rate_clip_max}]"
             )
+        elif self._sample_mode == "uniform":
+            print("[AsyncPromptBuffer] sample_strategy=uniform (random row sampling)")
+        elif self._sample_mode == "uniform_extreme_ucb":
+            print(
+                "[AsyncPromptBuffer] sample_strategy=uniform_extreme_ucb "
+                f"(endpoint alpha={self.uniform_extreme_alpha}, ucb_c={self.uniform_ucb_c})"
+            )
+        elif self._sample_mode == "weight_sequential":
+            print(
+                "[AsyncPromptBuffer] sample_strategy=weight_sequential "
+                "(row_weights = 0.5-|pass_rate-0.5|, traverse descending; "
+                "refresh row_weights + order once per dataset epoch)"
+            )
         else:
-            print("[AsyncPromptBuffer] Priority sampling disabled, using uniform random sampling")
+            print("[AsyncPromptBuffer] sample_strategy=sequential (round-robin by row index)")
 
         # Row-wise storage: prompt_uid -> {'pass_rate': float, 'count': int, 'row_indices': list[int]}
         self.meta_data: dict[str, dict[str, float | int | list[int]]] = {}
@@ -270,6 +390,10 @@ class AsyncPromptBuffer:
                     weight = self._priority_weight_fn(meta["pass_rate"])
                     for row_idx in meta.get("row_indices", []):
                         self.row_weights[row_idx] = weight
+        elif self._sample_mode == "uniform_extreme_ucb":
+            self._sync_row_weights()
+        elif self._sample_mode == "weight_sequential":
+            self._sync_row_weights()
 
         print(
             f"[AsyncPromptBuffer] Initialized with {len(dataset)} samples, "
@@ -279,9 +403,6 @@ class AsyncPromptBuffer:
     def get_single_sample(self) -> tuple[dict, str, float]:
         """Sample a single prompt from the buffer.
 
-        When priority sampling is disabled, this performs uniform random sampling,
-        which is equivalent to the original dataloader behavior.
-
         Returns:
             tuple of (batch_dict, prompt_uid, sampling_prob):
                 - batch_dict: Collated single-sample dict ready for prepare_single_generation_data
@@ -289,18 +410,39 @@ class AsyncPromptBuffer:
                 - sampling_prob: The sampling probability of this prompt (for IS correction)
         """
         eps = 0.001
+        n = len(self.dataset)
 
-        if self.use_priority:
+        if self._sample_mode == "sequential":
+            if n > 0:
+                idx = self._seq_cursor % n
+                self._seq_cursor += 1
+                sampling_prob = 1.0 / n
+            else:
+                idx = 0
+                sampling_prob = 0.0
+        elif self._sample_mode == "weight_sequential":
+            if n > 0 and self._weight_sequential_order:
+                order_len = len(self._weight_sequential_order)
+                pos = self._seq_cursor % order_len
+                idx = self._weight_sequential_order[pos]
+                self._seq_cursor += 1
+                sampling_prob = 1.0 / n
+                # One epoch = one full pass over rows in the frozen order; then resync weights.
+                if self._seq_cursor % order_len == 0:
+                    self._sync_row_weights()
+            else:
+                idx = 0
+                sampling_prob = 0.0
+        elif self._sample_mode == "uniform":
+            idx = torch.randint(0, n, (1,), generator=self.generator).item() if n > 0 else 0
+            sampling_prob = 1.0 / n if n > 0 else 0.0
+        else:
             # Priority-weighted sampling
             sampling_weights = torch.from_numpy(self.row_weights).float() + eps
             sampling_probs = sampling_weights / sampling_weights.sum()
             idx_tensor = torch.multinomial(sampling_probs, 1, replacement=True, generator=self.generator)
             idx = idx_tensor.item()
             sampling_prob = sampling_probs[idx].item()
-        else:
-            # Uniform random sampling (equivalent to original dataloader)
-            idx = torch.randint(0, len(self.dataset), (1,), generator=self.generator).item()
-            sampling_prob = 1.0 / len(self.dataset) if len(self.dataset) > 0 else 0.0
 
         # Get sample from dataset
         sample = self.dataset[idx]
@@ -330,8 +472,9 @@ class AsyncPromptBuffer:
         Called immediately after rollout finishes, before putting the sample
         into the message queue. This enables real-time priority updates.
 
-        When priority sampling is disabled, this still tracks pass_rate/count
-        for logging purposes, but does not affect sampling weights.
+        For ``weight_sequential``, only ``meta_data`` / ``pass_rate`` is updated here;
+        ``row_weights`` and visit order refresh at epoch end in ``get_single_sample``.
+        For non-priority modes otherwise, ``row_weights`` stay at defaults.
 
         Args:
             prompt_uid: The prompt identifier.
@@ -358,6 +501,8 @@ class AsyncPromptBuffer:
 
         info: dict[str, float] = {
             "prompt_buffer/dataset_size": num_total,
+            "prompt_buffer/unique_seen_prompts_total": num_seen,
+            "prompt_buffer/unique_seen_ratio": num_seen / num_total if num_total > 0 else 0.0,
             "prompt_buffer/zero_count_ratio": num_zero_count / num_total if num_total > 0 else 0.0,
             "prompt_buffer/zero_count_number": num_zero_count,
         }
@@ -407,9 +552,10 @@ class AsyncPromptBuffer:
             "generator_state": self.generator.get_state(),
             "seed": self.seed,
             "dataset_len": len(self.dataset),
+            "seq_cursor": self._seq_cursor,
             # Deep copy meta_data including row_indices for debug inspection.
             # row_indices will NOT be restored on load – see _merge_meta_data_from_state.
-            # NOTE: priority_strategy / alpha are intentionally NOT saved;
+            # NOTE: sample_strategy / alpha are intentionally NOT saved;
             # the values from __init__ (config) always take precedence.
             "meta_data": {k: dict(v) for k, v in self.meta_data.items()},
         }
@@ -422,6 +568,8 @@ class AsyncPromptBuffer:
             state_dict: State dictionary from state_dict().
         """
         self.generator.set_state(state_dict["generator_state"])
+        if "seq_cursor" in state_dict:
+            self._seq_cursor = int(state_dict["seq_cursor"])
 
         # Restore meta_data: merge checkpoint pass_rate/count into the current
         # dataset's meta_data rather than blindly overwriting.
@@ -435,6 +583,16 @@ class AsyncPromptBuffer:
     # ---------------------------------------------------------------------------
     # Internal methods
     # ---------------------------------------------------------------------------
+
+    def _rebuild_weight_sequential_order_from_row_weights(self) -> None:
+        """Derive traversal permutation from ``self.row_weights`` (descending weight, then row index)."""
+        n = len(self.row_weights)
+        if n <= 0:
+            self._weight_sequential_order = []
+            return
+        rows = list(range(n))
+        rows.sort(key=lambda i: (-float(self.row_weights[i]), i))
+        self._weight_sequential_order = rows
 
     def _init_pass_rates_from_dataset(self, dataset) -> None:
         """Initialize pass_rates and row_indices mapping from dataset.
@@ -480,7 +638,7 @@ class AsyncPromptBuffer:
                     if prompt_uid not in self.meta_data:
                         self.meta_data[prompt_uid] = {}
                     self.meta_data[prompt_uid]["pass_rate"] = float(pr)
-                    self.meta_data[prompt_uid]["count"] = 1
+                    self.meta_data[prompt_uid]["count"] = 0
                     num_init_samples += 1
 
             # Always register the row_idx -> prompt_uid reverse index
@@ -520,18 +678,47 @@ class AsyncPromptBuffer:
             f"{skipped_count} prompt_uids skipped (not in current dataset)"
         )
 
+    def _uniform_extreme_ucb_weight(self, pass_rate: float, count: int, log_t: float) -> float:
+        """Uniform-like weight with endpoint penalty and optional count-based exploration."""
+        p = float(pass_rate)
+        endpoint_factor = self.uniform_extreme_alpha if p <= 0.0 or p >= 1.0 else 1.0
+        if self.uniform_ucb_c <= 0.0:
+            return endpoint_factor
+
+        n_i = max(1, int(count))
+        exploration = self.uniform_ucb_c * float(np.sqrt(log_t / n_i))
+        return endpoint_factor * (1.0 + exploration)
+
     def _sync_row_weights(self) -> None:
         """Rebuild ``self.row_weights`` from ``self.meta_data``."""
         self.row_weights[:] = self._default_priority_weight
 
-        if not self.use_priority:
+        if self.use_priority:
+            for prompt_uid, meta in self.meta_data.items():
+                if "pass_rate" in meta:
+                    weight = self._priority_weight_fn(meta["pass_rate"])
+                    for row_idx in meta.get("row_indices", []):
+                        self.row_weights[row_idx] = weight
             return
 
-        for prompt_uid, meta in self.meta_data.items():
-            if "pass_rate" in meta:
-                weight = self._priority_weight_fn(meta["pass_rate"])
+        if self._sample_mode == "uniform_extreme_ucb":
+            total_count = sum(int(meta.get("count", 0)) for meta in self.meta_data.values())
+            log_t = float(np.log(max(2, total_count)))
+            for prompt_uid, meta in self.meta_data.items():
+                pr = float(meta["pass_rate"]) if "pass_rate" in meta else 0.5
+                count = int(meta.get("count", 0))
+                weight = self._uniform_extreme_ucb_weight(pr, count, log_t)
                 for row_idx in meta.get("row_indices", []):
                     self.row_weights[row_idx] = weight
+            return
+
+        if self._sample_mode == "weight_sequential":
+            for prompt_uid, meta in self.meta_data.items():
+                pr = float(meta["pass_rate"]) if "pass_rate" in meta else 0.5
+                w = pass_rate_to_weight_sequential_row_weight(pr)
+                for row_idx in meta.get("row_indices", []):
+                    self.row_weights[row_idx] = w
+            self._rebuild_weight_sequential_order_from_row_weights()
 
     def _update_meta_data(self, prompt_uid: str, pass_rate: float, count: int) -> None:
         """Apply exponential moving average update for a single sample's pass_rate."""
@@ -555,7 +742,9 @@ class AsyncPromptBuffer:
             np.clip(self.meta_data[prompt_uid]["pass_rate"], self.pass_rate_clip_min, self.pass_rate_clip_max)
         )
 
-        if self.use_priority:
+        if self.use_uniform_extreme_ucb:
+            self._sync_row_weights()
+        elif self.use_priority:
             weight = self._priority_weight_fn(self.meta_data[prompt_uid]["pass_rate"])
             for row_idx in self.meta_data[prompt_uid].get("row_indices", []):
                 self.row_weights[row_idx] = weight

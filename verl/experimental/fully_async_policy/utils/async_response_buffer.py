@@ -124,6 +124,8 @@ class AsyncResponseBuffer:
         fixed_rollout_n: Static N used by STOP_RULE_FIXED when no dynamic provider
             is given (stop once finished >= N).
         max_rollout_n: Global cap on # sequences per prompt for all rules.
+        min_positive_k: For STOP_RULE_AT_LEAST_POS, stop when finished sequences
+            include at least this many positive rewards (reward > 0).
         train_trigger: "fixed_prompt" or "fixed_samples". Recorded here for
             introspection / logging only -- the actual trigger decision lives
             on the trainer side (via the message queue's pending-sequence /
@@ -140,6 +142,7 @@ class AsyncResponseBuffer:
         stop_rule: str = STOP_RULE_FIXED,
         fixed_rollout_n: int = 8,
         max_rollout_n: int = 16,
+        min_positive_k: int = 1,
         train_trigger: str = TRAIN_TRIGGER_FIXED_PROMPT,
         dynamic_fixed_n_provider: Optional[Callable[[str], int]] = None,
     ):
@@ -160,10 +163,13 @@ class AsyncResponseBuffer:
             raise ValueError(
                 f"fixed_rollout_n ({fixed_rollout_n}) must not exceed max_rollout_n ({max_rollout_n})."
             )
+        if min_positive_k < 1:
+            raise ValueError(f"min_positive_k ({min_positive_k}) must be >= 1.")
 
         self.stop_rule = stop_rule
         self.fixed_rollout_n = fixed_rollout_n
         self.max_rollout_n = max_rollout_n
+        self.min_positive_k = min_positive_k
         self.train_trigger = train_trigger
         self.dynamic_fixed_n_provider = dynamic_fixed_n_provider
 
@@ -176,10 +182,11 @@ class AsyncResponseBuffer:
 
         logger.info(
             "[AsyncResponseBuffer] init: stop_rule=%s, fixed_rollout_n=%d, max_rollout_n=%d, "
-            "train_trigger=%s, dynamic_fixed_n_provider=%s",
+            "min_positive_k=%d, train_trigger=%s, dynamic_fixed_n_provider=%s",
             stop_rule,
             fixed_rollout_n,
             max_rollout_n,
+            min_positive_k,
             train_trigger,
             "enabled" if dynamic_fixed_n_provider is not None else "disabled",
         )
@@ -312,7 +319,7 @@ class AsyncResponseBuffer:
             threshold = min(self.max_rollout_n, int(math.ceil(1.0 / p)))
             stop = state.num_finished >= max(1, threshold)
         elif rule == STOP_RULE_AT_LEAST_POS:
-            stop = state.num_positive >= 1
+            stop = state.num_positive >= self.min_positive_k
         elif rule == STOP_RULE_AT_LEAST_POS_NEG:
             stop = state.num_positive >= 1 and state.num_negative >= 1
         elif rule == STOP_RULE_MAX:

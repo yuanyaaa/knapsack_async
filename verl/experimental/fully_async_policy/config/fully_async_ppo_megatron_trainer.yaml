@@ -39,7 +39,7 @@ async_training:
   rollout_config:
     working_pool_size: null
     stop_rule: "fixed_rollout"            # fixed_rollout | prefixed_rollout |
-                                          # has_at_least_positive |
+                                          # has_at_least_positive (k = min_rollout_n) |
                                           # has_at_least_positive_and_negative |
                                           # max_rollout
     max_rollout_n: 32
