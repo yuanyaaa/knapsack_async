@@ -51,6 +51,8 @@ def pearson_correlation_coefficient(tensor1: torch.Tensor, tensor2: torch.Tensor
         return 0
     mt1 = torch.masked_select(tensor1, mask)
     mt2 = torch.masked_select(tensor2, mask)
+    if mt1.numel() < 2 or mt2.numel() < 2:
+        return 0
     result = torch.corrcoef(torch.stack([mt1, mt2], dim=0))
     return result[0][1].detach().item()
 
@@ -100,6 +102,14 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     response_mask_bool = response_mask.bool()
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+    if rollout_probs_diff.numel() == 0:
+        return {
+            "training/rollout_probs_diff_valid": 0,
+            "training/rollout_probs_diff_max": 0.0,
+            "training/rollout_probs_diff_mean": 0.0,
+            "training/rollout_probs_diff_std": 0.0,
+            "training/rollout_actor_probs_pearson_corr": 0,
+        }
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),

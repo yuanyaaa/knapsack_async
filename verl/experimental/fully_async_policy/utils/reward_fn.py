@@ -1,24 +1,9 @@
 """
 Custom reward function for math tasks (AIME, MATH, deepscaler, etc.)
-and code generation tasks (codecontests, apps, codeforces, taco, livecodebench).
-Migrated from recipe/deepscaler/reward_fn.py and recipe/knapsack_rl/reward_fn.py
-with fixed import paths and Python 3.12+ compatibility (pyext replaced).
+Migrated from recipe/deepscaler/reward_fn.py with fixed import paths.
 """
-import base64
-import json
-import logging
-import multiprocessing
-import pickle
-import zlib
-
-from verl.utils.reward_score import math_dapo
-from verl.experimental.fully_async_policy.utils import math_utils
-from verl.experimental.fully_async_policy.utils import gpqa
-from verl.experimental.fully_async_policy.utils import prime_code
-from verl.experimental.fully_async_policy.utils.prime_code.testing_util import run_test
-
-logger = logging.getLogger(__name__)
-
+from verl.experimental.fully_async_policy.utils import math_utils, gpqa
+from verl.utils.reward_score import math_dapo, prime_math
 
 def extract_boxed_answer(solution: str) -> str:
     """Extract the answer from inside a LaTeX \\boxed{} command"""
@@ -80,62 +65,6 @@ def rllm_math_reward_fn(solution_str: str, ground_truth: str):
     return 0.0, False, model_answer
 
 
-def _lcb_run(in_outs, generation, debug, result, metadata_list, timeout):
-    """Worker function for LiveCodeBench test execution in a subprocess."""
-    r, m = run_test(in_outs, test=generation, debug=debug, timeout=timeout)
-    result.append(r)
-    metadata_list.append(m)
-
-
-def _lcb_check(in_outs, generation, timeout, debug=True):
-    """Run LiveCodeBench test cases with multiprocessing timeout protection."""
-    manager = multiprocessing.Manager()
-    result = manager.list()
-    metadata_list = manager.list()
-    p = multiprocessing.Process(
-        target=_lcb_run,
-        args=(in_outs, generation, debug, result, metadata_list, timeout),
-    )
-    p.start()
-    p.join(timeout=(timeout + 1) * len(in_outs["inputs"]) + 5)
-    if p.is_alive():
-        p.kill()
-    if not result:
-        result = [[-1 for _ in range(len(in_outs["inputs"]))]]
-    return result[0], metadata_list[0] if metadata_list else {}
-
-
-def _compute_livecodebench_score(solution_str: str, ground_truth) -> dict:
-    """Compute score for LiveCodeBench problems.
-
-    Extracts python code from the solution, decodes test cases from ground_truth
-    (supports both plain JSON and compressed pickle formats), and runs tests
-    with multiprocessing timeout protection.
-    """
-    # Extract python code block from completion
-    solution = solution_str.split("```python")[-1].split("```")[0]
-
-    # Decode test cases
-    try:
-        in_outs = json.loads(ground_truth)
-    except Exception:
-        in_outs = json.loads(
-            pickle.loads(zlib.decompress(base64.b64decode(ground_truth.encode("utf-8"))))
-        )
-
-    success = False
-    try:
-        test_res, _ = _lcb_check(in_outs=in_outs, generation=solution, timeout=6, debug=False)
-        success = all(map(lambda x: x is True, test_res))
-    except Exception:
-        logger.warning("LiveCodeBench test execution failed", exc_info=True)
-
-    return {
-        "score": 1.0 if success else 0.0,
-        "acc": bool(success),
-    }
-
-
 def compute_score(
     data_source,
     solution_str,
@@ -146,23 +75,26 @@ def compute_score(
     memory_limit_mb=None,
     prompt_str=None,
     return_pred=True,
-    **kwargs,
 ):
     """Compute the score for a given solution based on the data source.
 
-    This custom reward function handles AIME, MATH, deepscaler and other math
-    data sources that are not covered by the default verl reward function.
+    Args:
+        data_source (str): The source dataset identifier which determines the scoring method.
+        solution_str (str): The solution string to be evaluated.
+        ground_truth (str): The ground truth answer for comparison.
+        extra_info (dict, optional): Additional information that might be needed for scoring. Defaults to None.
 
-    Falls back to the default verl compute_score for known data sources.
+    Returns:
+        float: The computed score as a floating point number. If the result is a dictionary,
+               it returns the dictionary instead.
+
+    Raises:
+        NotImplementedError: If the reward function is not implemented for the given data source.
     """
-    if data_source in ["math_dapo", "math_dapo_reasoning"] or data_source.startswith("aime"):
+    if data_source == "math_dapo" or data_source.startswith("aime"):
         res = math_dapo.compute_score(solution_str, ground_truth)
 
-    elif data_source in [
-        "AIME", "AIME2025", "AMC", "MATH", "MINERVA",
-        "OLYMPIAD_BENCH", "deepscaler",
-        "DigitalLearningGmbH/MATH-lighteval",
-    ]:
+    elif data_source in ["AIME", "AIME2025", "AMC", "MATH", "MINERVA", "OLYMPIAD_BENCH", "deepscaler", "DigitalLearningGmbH/MATH-lighteval", "DAPO"]:
         score, is_correct, extracted_answer = rllm_math_reward_fn(solution_str, ground_truth)
         res = {
             "score": float(score),
@@ -170,9 +102,8 @@ def compute_score(
             "pred": extracted_answer if extracted_answer else str("[INVALID]"),
         }
 
-    elif data_source in ["Idavidrein/gpqa", "gpqa-diamond", "gpqa"]:
-        # GPQA multi-choice evaluation: first try pattern matching, then fallback to boxed answer
-        res = gpqa.compute_score(solution_str, ground_truth)
+    elif data_source in ["Idavidrein/gpqa"] :
+        res = gpqa.compute_score(solution_str, ground_truth)  # this does not capture the \\boxed case
 
         extracted_answer = extract_boxed_answer(solution_str)
         if res == 0:
@@ -186,30 +117,8 @@ def compute_score(
                 "pred": extracted_answer if extracted_answer else str("[INVALID]"),
             }
 
-    elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
-        # Code generation evaluation using prime_code (pyext-free, Python 3.12+ compatible)
-        score, metadata = prime_code.compute_score(solution_str, ground_truth, continuous=True)
-        res = {
-            "score": float(score) if isinstance(score, (int, float)) else (1.0 if score else 0.0),
-            "acc": bool(score == 1.0 if isinstance(score, float) else score is True),
-        }
-
-    elif "livecodebench" in data_source:
-        # LiveCodeBench evaluation with multiprocessing timeout protection
-        res = _compute_livecodebench_score(solution_str, ground_truth)
-
     else:
-        # Fallback to default verl compute_score for other data sources
-        from verl.utils.reward_score import default_compute_score
-        res = default_compute_score(
-            data_source=data_source,
-            solution_str=solution_str,
-            ground_truth=ground_truth,
-            extra_info=extra_info,
-            sandbox_fusion_url=sandbox_fusion_url,
-            concurrent_semaphore=concurrent_semaphore,
-            memory_limit_mb=memory_limit_mb,
-        )
+        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
     if isinstance(res, dict):
         return res

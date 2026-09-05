@@ -33,7 +33,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
-from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup, split_resource_pool
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
@@ -267,6 +267,64 @@ class AgentLoopBase(ABC):
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
+    def _clip_debug_text(self, value: Any, limit: int = 1200) -> str:
+        text = repr(value)
+        if len(text) <= limit:
+            return text
+        half = limit // 2
+        return f"{text[:half]} ... <truncated {len(text) - limit} chars> ... {text[-half:]}"
+
+    def _truncate_prompt_ids(
+        self,
+        prompt_ids: list[int],
+        *,
+        context: str,
+        messages: Optional[list[dict]] = None,
+        sample_info: Optional[dict[str, Any]] = None,
+    ) -> list[int]:
+        max_prompt_length = int(self.data_config.get("max_prompt_length", self.rollout_config.prompt_length))
+        if max_prompt_length <= 0 or len(prompt_ids) <= max_prompt_length:
+            return prompt_ids
+
+        truncation = self.data_config.get("truncation", "error")
+        head_text = self.tokenizer.decode(prompt_ids[: min(256, len(prompt_ids))], skip_special_tokens=False)
+        tail_text = self.tokenizer.decode(prompt_ids[-min(256, len(prompt_ids)) :], skip_special_tokens=False)
+        print(
+            "\n".join(
+                [
+                    "[AgentLoop][OverlongPrompt]",
+                    f"  context={context}",
+                    f"  prompt_len={len(prompt_ids)} max_prompt_length={max_prompt_length}",
+                    f"  truncation={truncation}",
+                    f"  sample_info={self._clip_debug_text(sample_info or {})}",
+                    f"  messages={self._clip_debug_text(messages or [])}",
+                    f"  prompt_head={self._clip_debug_text(head_text)}",
+                    f"  prompt_tail={self._clip_debug_text(tail_text)}",
+                ]
+            ),
+            flush=True,
+        )
+
+        if truncation == "left":
+            truncated = prompt_ids[-max_prompt_length:]
+        elif truncation == "right":
+            truncated = prompt_ids[:max_prompt_length]
+        elif truncation == "error":
+            raise ValueError(
+                f"Prompt length {len(prompt_ids)} exceeds max_prompt_length={max_prompt_length} in {context}"
+            )
+        else:
+            raise ValueError(f"Unknown truncation method {truncation}")
+
+        logger.warning(
+            "Truncated prompt in %s from %d to %d tokens using %s truncation",
+            context,
+            len(prompt_ids),
+            max_prompt_length,
+            truncation,
+        )
+        return truncated
+
     async def process_vision_info(self, messages: list[dict]) -> dict:
         """Extract images and videos from messages.
 
@@ -295,6 +353,7 @@ class AgentLoopBase(ABC):
         images: list[Image.Image] = None,
         videos: list[tuple[torch.Tensor, dict]] = None,
         remove_system_prompt: bool = False,
+        sample_info: Optional[dict[str, Any]] = None,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
 
@@ -354,7 +413,12 @@ class AgentLoopBase(ABC):
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]
 
-        return prompt_ids
+        return self._truncate_prompt_ids(
+            prompt_ids,
+            context="apply_chat_template",
+            messages=messages,
+            sample_info=sample_info,
+        )
 
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -450,6 +514,64 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+
+    def _clip_debug_text(self, value: Any, limit: int = 1200) -> str:
+        text = repr(value)
+        if len(text) <= limit:
+            return text
+        half = limit // 2
+        return f"{text[:half]} ... <truncated {len(text) - limit} chars> ... {text[-half:]}"
+
+    def _truncate_prompt_ids(
+        self,
+        prompt_ids: list[int],
+        *,
+        context: str,
+        messages: Optional[list[dict]] = None,
+        sample_info: Optional[dict[str, Any]] = None,
+    ) -> list[int]:
+        max_prompt_length = int(self.config.data.get("max_prompt_length", self.rollout_config.prompt_length))
+        if max_prompt_length <= 0 or len(prompt_ids) <= max_prompt_length:
+            return prompt_ids
+
+        truncation = self.config.data.get("truncation", "error")
+        head_text = self.tokenizer.decode(prompt_ids[: min(256, len(prompt_ids))], skip_special_tokens=False)
+        tail_text = self.tokenizer.decode(prompt_ids[-min(256, len(prompt_ids)) :], skip_special_tokens=False)
+        print(
+            "\n".join(
+                [
+                    "[AgentLoop][OverlongPrompt]",
+                    f"  context={context}",
+                    f"  prompt_len={len(prompt_ids)} max_prompt_length={max_prompt_length}",
+                    f"  truncation={truncation}",
+                    f"  sample_info={self._clip_debug_text(sample_info or {})}",
+                    f"  messages={self._clip_debug_text(messages or [])}",
+                    f"  prompt_head={self._clip_debug_text(head_text)}",
+                    f"  prompt_tail={self._clip_debug_text(tail_text)}",
+                ]
+            ),
+            flush=True,
+        )
+
+        if truncation == "left":
+            truncated = prompt_ids[-max_prompt_length:]
+        elif truncation == "right":
+            truncated = prompt_ids[:max_prompt_length]
+        elif truncation == "error":
+            raise ValueError(
+                f"Prompt length {len(prompt_ids)} exceeds max_prompt_length={max_prompt_length} in {context}"
+            )
+        else:
+            raise ValueError(f"Unknown truncation method {truncation}")
+
+        logger.warning(
+            "Truncated prompt in %s from %d to %d tokens using %s truncation",
+            context,
+            len(prompt_ids),
+            max_prompt_length,
+            truncation,
+        )
+        return truncated
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -596,6 +718,27 @@ class AgentLoopWorker:
         # config which may be concurrently mutated by validation overrides.
         if response_length is None:
             response_length = self.rollout_config.response_length
+        sample_info = {
+            key: kwargs.get(key)
+            for key in (
+                "index",
+                "data_source",
+                "prompt_uid",
+                "sampling_prob",
+                "pass_rate",
+                "sample_count",
+                "tools_kwargs",
+                "interaction_kwargs",
+                "extra_info",
+            )
+            if key in kwargs
+        }
+        output.prompt_ids = self._truncate_prompt_ids(
+            output.prompt_ids,
+            context="agent_loop_postprocess",
+            messages=kwargs.get("raw_prompt"),
+            sample_info=sample_info,
+        )
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
@@ -1008,6 +1151,31 @@ class AgentLoopManager:
                 *[
                     server.init_hybrid_colocated(self.worker_group, self.rollout_resource_pool)
                     for server in self.rollout_replicas
+                ]
+            )
+        elif self.rollout_config.get("pack_standalone_replicas", False):
+            # One shared STRICT_PACK pool shaped like the requested node layout, sliced per
+            # replica. Without this each replica allocates its own single-bundle placement
+            # group, so Ray spreads the replicas over every node with a free GPU and leaves
+            # the cluster too fragmented for another job's packed trainer group to fit.
+            # Derive the layout from world_size rather than re-reading nnodes, so the bundle
+            # count always matches num_replicas even when n_gpus_per_node is interpolated
+            # from the trainer's GPU count.
+            gpus_per_node = min(self.rollout_config.n_gpus_per_node, world_size)
+            shared_pool = RayResourcePool(
+                process_on_nodes=[gpus_per_node] * (world_size // gpus_per_node),
+                use_gpu=True,
+                name_prefix="rollout_pool_packed",
+            )
+            sub_pools = split_resource_pool(shared_pool, split_size=rollout_world_size)
+            assert len(sub_pools) == len(self.rollout_replicas), (
+                f"packed rollout pool split into {len(sub_pools)} slices but there are "
+                f"{len(self.rollout_replicas)} replicas"
+            )
+            await asyncio.gather(
+                *[
+                    server.init_standalone(pool)
+                    for server, pool in zip(self.rollout_replicas, sub_pools, strict=True)
                 ]
             )
         else:

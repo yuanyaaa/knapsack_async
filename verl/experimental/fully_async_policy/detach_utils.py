@@ -49,6 +49,23 @@ class RolloutSample:
     pass_rate: float = -1.0  # -1.0 means not yet observed
     sample_count: int = 0
 
+    # Per-prompt dynamic rollout diagnostics.
+    positive_count: int = -1
+    stop_reason: str = ""
+    raw_rollout_n: int = -1
+    raw_positive_count: int = -1
+    pos_neg_target_positive: int = -1
+    pos_neg_target_negative: int = -1
+    pos_neg_ratio_applied: bool = False
+    compensation_applied: bool = False
+    compensation_samples: int = 0
+    compensation_saved_budget: int = 0
+    compensation_base_n: int = -1
+    compensation_initial_n: int = -1
+    compensation_roi: float = 0.0
+    compensation_success_prob: float = 0.0
+    compensation_state: str = ""
+
 
 @dataclass
 class ValidateMetrics:
@@ -242,6 +259,23 @@ def assemble_batch_from_rollout_samples(
     pass_rates = [rs.pass_rate for rs in rollout_samples]
     sample_counts = [rs.sample_count for rs in rollout_samples]
     rollout_ns = [rs.rollout_n for rs in rollout_samples]
+    positive_counts = [rs.positive_count for rs in rollout_samples]
+    stop_reasons = [rs.stop_reason for rs in rollout_samples]
+    raw_rollout_ns = [rs.raw_rollout_n for rs in rollout_samples if rs.raw_rollout_n >= 0]
+    raw_positive_counts = [rs.raw_positive_count for rs in rollout_samples if rs.raw_positive_count >= 0]
+    pos_neg_applied = [rs for rs in rollout_samples if rs.pos_neg_ratio_applied]
+    compensated_samples = [rs for rs in rollout_samples if rs.compensation_applied]
+    saved_budget_samples = [rs for rs in rollout_samples if rs.compensation_saved_budget > 0]
+    posneg_flags = [
+        bool(pc >= 0 and pc > 0 and (rn - pc) > 0)
+        for pc, rn in zip(positive_counts, rollout_ns, strict=False)
+    ]
+    posneg_prompt_count = sum(1 for flag in posneg_flags if flag)
+    posneg_sample_count = sum(
+        int(rn)
+        for pc, rn in zip(positive_counts, rollout_ns, strict=False)
+        if pc >= 0 and pc > 0 and (rn - pc) > 0
+    )
 
     # Compute aggregate statistics for prompt buffer tracking
     observed_pass_rates = [pr for pr in pass_rates if pr >= 0]
@@ -262,24 +296,146 @@ def assemble_batch_from_rollout_samples(
             "fully_async/prompt_buffer/unique_prompt_uids": len(set(prompt_uids)),
         }
 
+    has_k_stats = {}
+    if rollout_ns:
+        valid_positive_counts = [pc for pc in positive_counts if pc >= 0]
+        total_prompts = len(rollout_ns)
+        total_samples = int(sum(rollout_ns))
+        reached_k = sum(1 for reason in stop_reasons if reason == "reached_k")
+        hit_max = sum(1 for reason in stop_reasons if reason == "hit_max")
+        reached_ratio = sum(1 for reason in stop_reasons if reason == "reached_ratio")
+        zero_positive = sum(1 for pc in valid_positive_counts if pc == 0)
+        has_k_stats = {
+            "fully_async/has_k/batch_prompt_count": total_prompts,
+            "fully_async/has_k/batch_sample_count": total_samples,
+            "fully_async/has_k/actual_rollout_n_mean": float(np.mean(rollout_ns)),
+            "fully_async/has_k/actual_rollout_n_p90": float(np.percentile(rollout_ns, 90)),
+            "fully_async/has_k/actual_rollout_n_max": int(max(rollout_ns)),
+            "fully_async/has_k/reached_k_ratio": reached_k / total_prompts if total_prompts else 0.0,
+            "fully_async/has_k/reached_ratio_ratio": reached_ratio / total_prompts if total_prompts else 0.0,
+            "fully_async/has_k/hit_max_ratio": hit_max / total_prompts if total_prompts else 0.0,
+            "fully_async/posneg/prompts_per_step": float(posneg_prompt_count),
+            "fully_async/posneg/samples_per_step": float(posneg_sample_count),
+            "fully_async/posneg/prompt_ratio": (
+                float(posneg_prompt_count) / float(total_prompts) if total_prompts else 0.0
+            ),
+            "fully_async/posneg/sample_ratio": (
+                float(posneg_sample_count) / float(total_samples) if total_samples else 0.0
+            ),
+        }
+        if valid_positive_counts:
+            has_k_stats.update(
+                {
+                    "fully_async/has_k/positive_count_mean": float(np.mean(valid_positive_counts)),
+                    "fully_async/has_k/zero_positive_ratio": (
+                        zero_positive / len(valid_positive_counts) if valid_positive_counts else 0.0
+                    ),
+                }
+            )
+        if pos_neg_applied:
+            selected_negative_counts = [
+                rs.rollout_n - rs.positive_count for rs in pos_neg_applied if rs.positive_count >= 0
+            ]
+            pos_neg_stats = {
+                "fully_async/pos_neg_ratio/batch_applied_prompt_count": len(pos_neg_applied),
+                "fully_async/pos_neg_ratio/batch_applied_ratio": (
+                    len(pos_neg_applied) / total_prompts if total_prompts else 0.0
+                ),
+                "fully_async/pos_neg_ratio/target_positive": float(pos_neg_applied[0].pos_neg_target_positive),
+                "fully_async/pos_neg_ratio/target_negative": float(pos_neg_applied[0].pos_neg_target_negative),
+                "fully_async/pos_neg_ratio/selected_positive_count_mean": float(
+                    np.mean([rs.positive_count for rs in pos_neg_applied])
+                ),
+                "fully_async/pos_neg_ratio/selected_negative_count_mean": float(
+                    np.mean(selected_negative_counts)
+                ),
+            }
+            if raw_rollout_ns:
+                pos_neg_stats.update(
+                    {
+                        "fully_async/pos_neg_ratio/raw_rollout_n_mean": float(np.mean(raw_rollout_ns)),
+                        "fully_async/pos_neg_ratio/raw_rollout_n_max": int(max(raw_rollout_ns)),
+                    }
+                )
+            if raw_positive_counts:
+                pos_neg_stats["fully_async/pos_neg_ratio/raw_positive_count_mean"] = float(
+                    np.mean(raw_positive_counts)
+                )
+            has_k_stats.update(pos_neg_stats)
+
+        compensation_prompt_count = len(compensated_samples)
+        compensation_sample_count = int(sum(rs.compensation_samples for rs in compensated_samples))
+        compensation_success_count = sum(
+            1
+            for rs in compensated_samples
+            if rs.positive_count > 0 and (rs.rollout_n - rs.positive_count) > 0
+        )
+        compensation_accs = [
+            float(rs.positive_count) / float(rs.rollout_n)
+            for rs in compensated_samples
+            if rs.rollout_n > 0 and rs.positive_count >= 0
+        ]
+        compensation_rois = [float(rs.compensation_roi) for rs in compensated_samples]
+        compensation_stats = {
+            "fully_async/compensation/bank_deposited_prompts_per_step": float(len(saved_budget_samples)),
+            "fully_async/compensation/bank_deposited_samples_per_step": float(
+                sum(rs.compensation_saved_budget for rs in saved_budget_samples)
+            ),
+            "fully_async/compensation/prompts_per_step": float(compensation_prompt_count),
+            "fully_async/compensation/samples_per_step": float(compensation_sample_count),
+            "fully_async/compensation/prompt_ratio": (
+                compensation_prompt_count / total_prompts if total_prompts else 0.0
+            ),
+            "fully_async/compensation/success_ratio_per_step": (
+                compensation_success_count / compensation_prompt_count if compensation_prompt_count else 0.0
+            ),
+            "fully_async/compensation/final_acc_mean_per_step": (
+                float(np.mean(compensation_accs)) if compensation_accs else 0.0
+            ),
+            "fully_async/compensation/roi_mean_per_step": (
+                float(np.mean(compensation_rois)) if compensation_rois else 0.0
+            ),
+        }
+        has_k_stats.update(compensation_stats)
+
     # add meta_info
-    trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
+    prompt_start_versions = final_batch.non_tensor_batch.get(
+        "prompt_start_version",
+        final_batch.non_tensor_batch["min_global_steps"],
+    )
+    response_end_versions = final_batch.non_tensor_batch.get(
+        "response_end_version",
+        final_batch.non_tensor_batch["max_global_steps"],
+    )
+    trajectory_param_versions = response_end_versions
 
     final_batch.meta_info.update(
         {
             "param_version_diversity": len(set(trajectory_param_versions)),
             "trajectory_param_versions": trajectory_param_versions,
+            "prompt_start_versions": prompt_start_versions,
+            "response_end_versions": response_end_versions,
             # Per-sample prompt buffer tracking (list-level, for detailed inspection)
             "prompt_uids": prompt_uids,
             "sampling_probs": sampling_probs,
             "pass_rates": pass_rates,
             "sample_counts": sample_counts,
             "rollout_ns": rollout_ns,
+            "positive_counts": positive_counts,
+            "stop_reasons": stop_reasons,
+            "posneg_flags": posneg_flags,
+            "compensation_applied": [rs.compensation_applied for rs in rollout_samples],
+            "compensation_samples": [rs.compensation_samples for rs in rollout_samples],
+            "compensation_saved_budget": [rs.compensation_saved_budget for rs in rollout_samples],
+            "compensation_roi": [rs.compensation_roi for rs in rollout_samples],
+            "compensation_success_prob": [rs.compensation_success_prob for rs in rollout_samples],
+            "compensation_state": [rs.compensation_state for rs in rollout_samples],
             **processing_time_stats,
             **rollout_status,
             **partial_stats,
             **tool_calls_stats,
             **prompt_buffer_stats,
+            **has_k_stats,
         }
     )
 
@@ -292,20 +448,20 @@ def compute_staleness_metrics(
     current_param_version: int,
     prompt_aggregation: str = "max",
 ) -> dict[str, float]:
-    """Compute policy staleness metrics for a training batch.
+    """Compute hytuner-style staleness metrics for a training batch.
 
-    Staleness definition (per user request):
+    Staleness definition:
 
-    - Response (sequence) staleness = ``current_param_version`` (the policy version
-      being trained right now) - ``min_global_steps`` (the policy version that was
-      used when the sequence *started* rolling out).
-      Intuitively: "how many parameter updates happened between the moment this
-      response started being generated and the moment we are training on it."
+    - Prompt staleness = ``current_param_version - prompt_start_version``.
+      This matches hytuner's ``current_step - start_version``.
 
-    - Prompt staleness = aggregation (``max`` by default, or ``mean``) over the
-      per-response staleness values within the same prompt. A prompt's responses
-      are identified by ``rollout_ns`` in ``batch.meta_info`` which records how
-      many responses each prompt generated (in the same order as ``prompt_uids``).
+    - Response staleness = ``current_param_version - response_end_version``.
+      This matches hytuner's ``current_step - end_version`` and measures how
+      long a finished response waited before being consumed for training.
+
+    The old policy-staleness signal is still reported separately as
+    ``policy_response_staleness_*`` using ``min_global_steps`` so we can keep
+    diagnosing off-policy drift without overloading ``response_staleness``.
 
     Reported metrics:
 
@@ -319,9 +475,9 @@ def compute_staleness_metrics(
       the mini-batch (after per-prompt aggregation).
 
     Args:
-        batch: Assembled ``DataProto``. Must contain
-            ``non_tensor_batch["min_global_steps"]`` (per response) and
-            ``meta_info["rollout_ns"]`` (per prompt).
+        batch: Assembled ``DataProto``. Preferably contains per-response
+            ``prompt_start_version`` and ``response_end_version``. Falls back
+            to ``min_global_steps`` / ``max_global_steps`` for older samples.
         current_param_version: The policy version of the trainer at the moment
             this batch is consumed for training.
         prompt_aggregation: How to aggregate response-level staleness into
@@ -335,19 +491,21 @@ def compute_staleness_metrics(
             f"prompt_aggregation must be 'max' or 'mean', got {prompt_aggregation!r}"
         )
 
-    # Align with assemble_batch_from_rollout_samples: these two non_tensor fields
-    # are always populated together by the agent loop, so we index them directly
-    # (no None / missing-key fallback), matching the style of the existing
-    # ``param_version_diff`` computation upstream.
     param_version_start = batch.non_tensor_batch["min_global_steps"]
     param_version_end = batch.non_tensor_batch["max_global_steps"]
+    prompt_start_versions = batch.non_tensor_batch.get("prompt_start_version", param_version_start)
+    response_end_versions = batch.non_tensor_batch.get("response_end_version", param_version_end)
 
-    # Per-response (sequence) staleness = current training version - the policy
-    # version when the sequence started rolling out.
-    per_response_staleness = [float(current_param_version) - float(v) for v in param_version_start]
-    # Per-response rollout span (how many param updates happened while the
-    # sequence was being generated). Kept for convenience; mirrors the existing
-    # ``param_version_diff`` upstream but signed instead of abs().
+    # Hytuner-style response staleness: how long completed responses waited
+    # before being consumed by the trainer.
+    per_response_staleness = [
+        float(current_param_version) - float(v) for v in response_end_versions
+    ]
+    # Keep the old policy staleness under an explicit name.
+    per_policy_response_staleness = [
+        float(current_param_version) - float(v) for v in param_version_start
+    ]
+    # How many param updates happened while the sequence was being generated.
     per_response_rollout_span = [
         float(e) - float(s) for s, e in zip(param_version_start, param_version_end, strict=True)
     ]
@@ -356,11 +514,22 @@ def compute_staleness_metrics(
         "fully_async/staleness/response_staleness_mean": float(np.mean(per_response_staleness)),
         "fully_async/staleness/response_staleness_max": float(np.max(per_response_staleness)),
         "fully_async/staleness/response_staleness_min": float(np.min(per_response_staleness)),
+        "fully_async/staleness/policy_response_staleness_mean": float(
+            np.mean(per_policy_response_staleness)
+        ),
+        "fully_async/staleness/policy_response_staleness_max": float(
+            np.max(per_policy_response_staleness)
+        ),
+        "fully_async/staleness/policy_response_staleness_min": float(
+            np.min(per_policy_response_staleness)
+        ),
         "fully_async/staleness/response_rollout_span_mean": float(np.mean(per_response_rollout_span)),
         "fully_async/staleness/response_rollout_span_max": float(np.max(per_response_rollout_span)),
     }
 
-    # Compute prompt-level staleness using rollout_ns to slice per-response values.
+    # Compute prompt-level staleness using rollout_ns to slice per-response
+    # prompt_start_version values. All rows in a prompt should share the same
+    # prompt_start_version; aggregating keeps the function robust to older data.
     rollout_ns = batch.meta_info.get("rollout_ns", None) if hasattr(batch, "meta_info") else None
     if rollout_ns is not None and len(rollout_ns) > 0:
         per_prompt_staleness: list[float] = []
@@ -369,7 +538,10 @@ def compute_staleness_metrics(
             n = int(n)
             if n <= 0:
                 continue
-            group = per_response_staleness[idx : idx + n]
+            group = [
+                float(current_param_version) - float(v)
+                for v in prompt_start_versions[idx : idx + n]
+            ]
             idx += n
             if prompt_aggregation == "max":
                 per_prompt_staleness.append(float(np.max(group)))
@@ -406,6 +578,10 @@ class MetricsAggregator:
         return {
             # Time-Based metrics, can add metrics here
             "time_sum": ["perf/time_per_step"],
+            "sum": [
+                "fully_async/posneg/prompts_per_step",
+                "fully_async/posneg/samples_per_step",
+            ],
             "min": ["timing_s/agent_loop/tool_calls/min"],
             "avg": ["timing_s/agent_loop/tool_calls/mean"],
             "max": ["timing_s/agent_loop/tool_calls/max"],
@@ -419,6 +595,11 @@ class MetricsAggregator:
                 "fully_async/count/dropped_samples",
                 "fully_async/count/rejected_prompts",
                 "fully_async/count/rejected_samples",
+                "fully_async/posneg/prompts_cum",
+                "fully_async/posneg/samples_cum",
+                "fully_async/posneg/prompts_per_sec",
+                "fully_async/posneg/samples_per_sec",
+                "fully_async/posneg/window_seconds",
                 "training/global_step",  # TODO change name to: total_step
             ],
         }

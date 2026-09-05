@@ -48,18 +48,32 @@ fi
 
 # ==================== Data Columns ====================
 PROMPT_KEY=${PROMPT_KEY:-"prompt"}
+ENABLE_THINKING=${ENABLE_THINKING:-}
+
+THINKING_OVERRIDE=()
+if [ -n "${ENABLE_THINKING}" ]; then
+    THINKING_OVERRIDE+=("+data.apply_chat_template_kwargs.enable_thinking=${ENABLE_THINKING}")
+fi
 
 # ==================== Filtering (for analyze_val_jsonl.py) ====================
-FILTER_PASS_RATE_MIN=${FILTER_PASS_RATE_MIN:-0}      # pass_rate > 0 (filter out all-wrong)
-FILTER_PASS_RATE_MAX=${FILTER_PASS_RATE_MAX:-1}      # pass_rate < 1 (filter out all-correct)
-FILTER_OVERLONG_MAX=${FILTER_OVERLONG_MAX:-0.05}     # overlong_ratio <= 0.05
+# Set any of these to the empty string to disable that filter entirely.
+FILTER_PASS_RATE_MIN=${FILTER_PASS_RATE_MIN-0}       # pass_rate > 0 (filter out all-wrong)
+FILTER_PASS_RATE_MAX=${FILTER_PASS_RATE_MAX-1}       # pass_rate < 1 (filter out all-correct)
+FILTER_OVERLONG_MAX=${FILTER_OVERLONG_MAX-0.05}      # overlong_ratio <= 0.05
+
+# ==================== Pass-rate clipping ====================
+# The prior written to extra_info.pass_rate is clip(raw_pass_rate, low, upper). The default
+# 0.125 floor gives never-solved problems a 4p(1-p) of 0.4375, which makes medium_focus
+# adaptive n treat them as mid-difficulty forever; lower it when that matters.
+SAFE_LOW_BOUND=${SAFE_LOW_BOUND:-0.125}
+SAFE_UPPER_BOUND=${SAFE_UPPER_BOUND:-0.875}
 
 # ==================== Lightweight JSON ====================
 EXTRACT_LIGHTWEIGHT=${EXTRACT_LIGHTWEIGHT:-true}     # Extract lightweight JSON after JSONL dump
 LIGHTWEIGHT_JSON=${LIGHTWEIGHT_JSON:-""}             # Path to lightweight JSON (auto-generated if empty)
 
 # ==================== Logging ====================
-LOG_DIR="/apdcephfs/share_302503006/ziniuli/project/verl-main/logs"
+LOG_DIR=${LOG_DIR:-"/apdcephfs/share_302503006/ziniuli/project/verl-main/logs"}
 mkdir -p "${LOG_DIR}"
 TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
 LOG_FILE="${LOG_DIR}/evaluate_and_filter_fully_async_${TIMESTAMP}.log"
@@ -107,7 +121,10 @@ echo "  Model:       ${MODEL_PATH}"
 echo "  Reward:      ${REWARD_FN_PATH}::${REWARD_FN_NAME}"
 echo "  Samples:     ${N_SAMPLES}"
 echo "  Model name:  ${MODEL_NAME:-'(auto from MODEL_PATH)'}"
+echo "  Thinking:    ${ENABLE_THINKING:-'(model default)'}"
 echo "  Trunc len:   ${TRUNCATION_LENGTH}"
+echo "  Clip prior:  [${SAFE_LOW_BOUND}, ${SAFE_UPPER_BOUND}]"
+echo "  Filters:     pass_rate_min=${FILTER_PASS_RATE_MIN:-'(off)'} pass_rate_max=${FILTER_PASS_RATE_MAX:-'(off)'} overlong_max=${FILTER_OVERLONG_MAX:-'(off)'}"
 echo "  Val batch:   ${VAL_BATCH_SIZE}"
 echo "  Lightweight: ${LIGHTWEIGHT_JSON}"
 echo "  Log file:    ${LOG_FILE}"
@@ -168,8 +185,10 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=grpo \
     critic.enable=False \
     async_training.use_trainer_do_validate=True \
+    async_training.staleness_threshold=0 \
     async_training.trigger_parameter_sync_step=1 \
-    async_training.require_batches=1
+    async_training.require_batches=1 \
+    "${THINKING_OVERRIDE[@]}"
 
 echo "[Step 1/3] Validation JSONL dump complete: ${VAL_DATA_DIR}"
 
@@ -205,6 +224,7 @@ fi
 if [ -n "${FILTER_OVERLONG_MAX}" ]; then
     ANALYZE_ARGS="${ANALYZE_ARGS} --filter_overlong_ratio_max ${FILTER_OVERLONG_MAX}"
 fi
+ANALYZE_ARGS="${ANALYZE_ARGS} --safe_low_bound ${SAFE_LOW_BOUND} --safe_upper_bound ${SAFE_UPPER_BOUND}"
 
 # Determine rollout_model_name: use MODEL_NAME if set, otherwise fall back to MODEL_PATH
 ROLLOUT_MODEL_NAME=${MODEL_NAME:-${MODEL_PATH}}

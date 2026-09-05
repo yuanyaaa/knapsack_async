@@ -49,7 +49,8 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # ==================== Experiment ====================
-export SWANLAB_API_KEY=gA7Qq7QqbUG7qm5v3X8Ua
+: "${SWANLAB_API_KEY:?set SWANLAB_API_KEY before launching}"
+export SWANLAB_API_KEY
 
 project_name="knapsack_async"
 exp_name_base="GRPO-Qwen2.5-Math-1.5b-DAPO-raw-4-4-${sample_strategy}-${adaptive_rollout_n_strategy}-${train_trigger}-${stop_rule}"

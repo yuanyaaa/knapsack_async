@@ -129,4 +129,7 @@ ENV/
 logs
 log
 outputs
+monitor_logs/
+local_data/
+working.md
 .history

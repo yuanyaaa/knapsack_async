@@ -30,7 +30,9 @@ async_training:
 
   # ==================== Prompt Buffer (Sample Strategy + Adaptive Rollout N) ====================
   # AsyncPromptBuffer is always used. sample_strategy:
-  #   null | sequential — round-robin by dataset row index (default)
+  #   null | shuffle_sequential — shuffle once per dataset epoch, then traverse
+  #                               without replacement (default)
+  #   sequential         — round-robin by dataset row index without shuffling
   #   uniform            — uniform random row
   #   uniform_extreme_ucb — weighted random row: uniform by default, p=0/p=1 rows
   #                         are downweighted by uniform_extreme_alpha, and
@@ -39,7 +41,7 @@ async_training:
   #                       pass_rate 每步更新，row_weights 与顺序每「数据集一轮」结束刷新一次
   #   medium | hard | medium_sharp | medium_with_exploration — pass_rate-weighted sampling
 
-  sample_strategy: null
+  sample_strategy: shuffle_sequential
 
   # Hyperparameters for sample_strategy=uniform_extreme_ucb.
   # Same alpha is used for p=0 and p=1 endpoints.
@@ -88,6 +90,9 @@ async_training:
     #   prefixed_rollout                       stop when finished >= ceil(1/sampling_prob)
     #   has_at_least_positive                  stop when #positive rewards >= min_rollout_n
     #   has_at_least_positive_and_negative     stop when there is >= 1 pos AND >= 1 neg
+    #   continue_on_mixed_chunk                generate in chunks; continue only when the latest chunk has both pos and neg
+    #   adaptive_chunk_mixed                   after each chunk, blend historical pass_rate and current rollout
+    #                                          pass_rate, then stop once finished >= estimated N for a mixed group
     #   max_rollout                            stop when finished >= max_rollout_n
     stop_rule: "fixed_rollout"
 
@@ -123,10 +128,39 @@ async_training:
     # decorator.
     adaptive_rollout_n_strategy: null
 
+    # For stop_rule=adaptive_chunk_mixed:
+    #   w = min(1, k / adaptive_chunk_prior_tau)
+    #   p_hat = (1 - w) * historical_pass_rate + w * current_rollout_pass_rate
+    # Once k >= adaptive_chunk_prior_tau, p_hat is exactly the current rollout
+    # pass rate. Default 8 means after 8 rollouts, ignore historical pass_rate.
+    # Then allocate target N by a productive utility curve:
+    #   p_hat < 0.5       -> N grows from min_n to max_n
+    #   0.5 <= p_hat <= .8 -> N stays near max_n
+    #   p_hat > 0.8       -> N decays from max_n to min_n
+    # rounded up to rollout_chunk_size.
+    adaptive_chunk_alpha: 0.5
+    adaptive_chunk_prior_tau: 8.0
+    # Kept for backward-compatible shell overrides; not used by the
+    # productive-utility adaptive_chunk_mixed rule.
+    adaptive_mixed_target_prob: 0.85
+
     # Lower clamp on adaptive rollout_n (when adaptive_rollout_n_strategy is set),
-    # OR the required #positive rewards k for stop_rule=has_at_least_positive.
+    # OR the required #positive rewards k for stop_rule=has_at_least_positive,
+    # OR the lower clamp for stop_rule=adaptive_chunk_mixed.
     # Upper clamp for adaptive strategies is ``max_rollout_n`` above.
     min_rollout_n: 2
+
+    # Submit this many sequences per generation request instead of strictly
+    # one-by-one. The rollouter clamps the last request to the current
+    # stop-rule target: fixed_rollout/prefixed_rollout target N, or
+    # max_rollout_n for dynamic stop rules such as has_at_least_positive.
+    rollout_chunk_size: 2
+
+    # Optional positive:negative composition control for emitted has-k groups.
+    # Example: "1:7" with rollout.n=8 makes every accepted prompt emit exactly
+    # 1 positive and 7 negative samples. If the generated prompt cannot satisfy
+    # the target before max_rollout_n, it is dropped before queueing.
+    positive_negative_ratio: null
 
     # Training-trigger rule. One of:
     #   fixed_prompt       trigger when number of completed prompt_uids reaches a threshold

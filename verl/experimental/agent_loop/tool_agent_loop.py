@@ -63,6 +63,7 @@ class AgentData:
         tools_kwargs: dict[str, Any],
         interaction: Optional[BaseInteraction] = None,
         interaction_kwargs: Optional[dict[str, Any]] = None,
+        sample_info: Optional[dict[str, Any]] = None,
     ):
         self.messages = messages
         self.image_data = image_data
@@ -72,6 +73,7 @@ class AgentData:
         self.tools_kwargs = tools_kwargs
         self.interaction = interaction
         self.interaction_kwargs = interaction_kwargs or {}
+        self.sample_info = sample_info or {}
 
         # State variables
         self.prompt_ids: list[int] = []
@@ -158,6 +160,21 @@ class ToolAgentLoop(AgentLoopBase):
             tools_kwargs=tools_kwargs,
             interaction=interaction,
             interaction_kwargs=interaction_kwargs,
+            sample_info={
+                key: kwargs.get(key)
+                for key in (
+                    "index",
+                    "data_source",
+                    "prompt_uid",
+                    "sampling_prob",
+                    "pass_rate",
+                    "sample_count",
+                    "tools_kwargs",
+                    "interaction_kwargs",
+                    "extra_info",
+                )
+                if key in kwargs
+            },
         )
 
         # State machine loop
@@ -207,6 +224,7 @@ class ToolAgentLoop(AgentLoopBase):
             tools=self.tool_schemas,
             images=agent_data.image_data,
             videos=agent_data.video_data,
+            sample_info=agent_data.sample_info,
         )
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING

@@ -73,7 +73,12 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        print(f"ray init kwargs: {ray_init_kwargs}")
+        printable_ray_init_kwargs = OmegaConf.to_container(ray_init_kwargs, resolve=True)
+        env_vars = printable_ray_init_kwargs.get("runtime_env", {}).get("env_vars", {})
+        for key in list(env_vars):
+            if "KEY" in key or "TOKEN" in key or "SECRET" in key:
+                env_vars[key] = "***"
+        print(f"ray init kwargs: {printable_ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:

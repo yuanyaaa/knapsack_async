@@ -155,7 +155,7 @@ class RLHFDataset(Dataset):
         dataframes = []
         for parquet_file in self.data_files:
             # read files and cache
-            if parquet_file.endswith(".parquet"):
+            if parquet_file.endswith((".parquet", ".pq")):
                 try:
                     dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
                 except Exception as e:

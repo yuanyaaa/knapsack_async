@@ -35,6 +35,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        sample_info = {
+            key: kwargs.get(key)
+            for key in (
+                "index",
+                "data_source",
+                "prompt_uid",
+                "sampling_prob",
+                "pass_rate",
+                "sample_count",
+                "tools_kwargs",
+                "interaction_kwargs",
+                "extra_info",
+            )
+            if key in kwargs
+        }
 
         # 1. extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -46,6 +61,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             messages,
             images=images,
             videos=videos,
+            sample_info=sample_info,
         )
 
         # 3. generate sequences

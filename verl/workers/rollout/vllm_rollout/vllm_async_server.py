@@ -21,12 +21,12 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import vllm
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
@@ -54,6 +54,11 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
+try:
+    from vllm.entrypoints.cli.serve import run_headless
+except ImportError:  # vLLM 0.8.x has no DP headless helper
+    run_headless = None
+
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -74,6 +79,62 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+# CLI / compilation knobs that current verl code always emits, but older vLLM
+# (notably 0.8.5) will SystemExit on. That shows up as Ray ActorDiedError.
+_VLLM_HAS_CUGRAPH_MODE = _VLLM_VERSION >= version.parse("0.10.0")
+_VLLM_HAS_LOGPROBS_MODE = _VLLM_VERSION >= version.parse("0.10.0")
+
+
+def _collect_option_strings(parser: argparse.ArgumentParser) -> set[str]:
+    opts: set[str] = set()
+    for action in parser._actions:
+        opts.update(action.option_strings)
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            for subparser in choices.values():
+                opts |= _collect_option_strings(subparser)
+    return opts
+
+
+def _filter_unknown_cli_args(argv: list[str], known_opts: set[str]) -> list[str]:
+    """Drop flags the installed vLLM argparse parser does not know.
+
+    Unknown flags make argparse call sys.exit(2), which Ray reports as
+    ActorDiedError with no inner traceback.
+    """
+    filtered: list[str] = []
+    skipped: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("--"):
+            filtered.append(tok)
+            i += 1
+            continue
+        key = tok.split("=", 1)[0]
+        # FlexibleArgumentParser accepts underscore spellings for options that
+        # argparse registers with hyphens (for example worker_extension_cls).
+        normalized_key = "--" + key[2:].replace("_", "-")
+        if key in known_opts or normalized_key in known_opts:
+            filtered.append(tok)
+            if "=" not in tok:
+                i += 1
+                while i < len(argv) and not argv[i].startswith("--"):
+                    filtered.append(argv[i])
+                    i += 1
+            else:
+                i += 1
+            continue
+        skipped.append(tok)
+        i += 1
+        if "=" not in tok:
+            while i < len(argv) and not argv[i].startswith("--"):
+                skipped.append(argv[i])
+                i += 1
+    if skipped:
+        logger.warning("Dropped unsupported vLLM CLI args for vLLM %s: %s", vllm.__version__, skipped)
+    return filtered
 
 
 class vLLMHttpServer:
@@ -286,19 +347,21 @@ class vLLMHttpServer:
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
-        compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")
+        if _VLLM_HAS_CUGRAPH_MODE:
+            compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")
+            # FULL cuda graph is not yet supported with DCP, downgrade to PIECEWISE
+            dcp_size = engine_kwargs.get("decode_context_parallel_size", 1) or 1
+            if dcp_size > 1 and compilation_config.get("cudagraph_mode") == "FULL_AND_PIECEWISE":
+                logger.warning(
+                    "FULL cuda graph is not supported with DCP (decode_context_parallel_size=%d), "
+                    "downgrading cudagraph_mode to PIECEWISE.",
+                    dcp_size,
+                )
+                compilation_config["cudagraph_mode"] = "PIECEWISE"
+        else:
+            compilation_config.pop("cudagraph_mode", None)
 
-        # FULL cuda graph is not yet supported with DCP, downgrade to PIECEWISE
-        dcp_size = engine_kwargs.get("decode_context_parallel_size", 1) or 1
-        if dcp_size > 1 and compilation_config["cudagraph_mode"] == "FULL_AND_PIECEWISE":
-            logger.warning(
-                "FULL cuda graph is not supported with DCP (decode_context_parallel_size=%d), "
-                "downgrading cudagraph_mode to PIECEWISE.",
-                dcp_size,
-            )
-            compilation_config["cudagraph_mode"] = "PIECEWISE"
-
-        compilation_config = json.dumps(compilation_config)
+        compilation_config = json.dumps(compilation_config) if compilation_config else None
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
@@ -312,7 +375,6 @@ class vLLMHttpServer:
             "max_num_batched_tokens": self.config.max_num_batched_tokens,
             "enable_prefix_caching": self.config.enable_prefix_caching,
             "enable_sleep_mode": self.config.enable_sleep_mode,
-            "logprobs_mode": self.config.logprobs_mode,
             "enforce_eager": self.config.enforce_eager,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
@@ -325,6 +387,8 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+        if _VLLM_HAS_LOGPROBS_MODE:
+            args["logprobs_mode"] = self.config.logprobs_mode
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -422,7 +486,14 @@ class vLLMHttpServer:
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
-        server_args = parser.parse_args(args=server_args)
+        server_args = _filter_unknown_cli_args(server_args, _collect_option_strings(parser))
+        try:
+            server_args = parser.parse_args(args=server_args)
+        except SystemExit as e:
+            raise RuntimeError(
+                f"vLLM {vllm.__version__} rejected serve CLI args; "
+                "installed vLLM is older than this async HTTP server path."
+            ) from e
         server_args.model = server_args.model_tag
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
@@ -482,6 +553,12 @@ class vLLMHttpServer:
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
+        if run_headless is None:
+            raise RuntimeError(
+                f"vLLM {vllm.__version__} does not provide run_headless; "
+                "multi-node vLLM data-parallel replicas need a newer vLLM. "
+                "Single-node rollout (NNODES_ROLLOUT=1) should not reach this path."
+            )
         args.api_server_count = 0
 
         def run_headless_wrapper():

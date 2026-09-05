@@ -1,0 +1,13 @@
+.git/
+monitor_logs/
+ckpts/
+logs/
+log/
+outputs/
+.cache/
+__pycache__/
+*.py[cod]
+*.log
+*.pt
+*.ckpt
+*.tar.gz

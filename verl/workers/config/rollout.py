@@ -145,6 +145,11 @@ class RolloutConfig(BaseConfig):
     nnodes: int = 0
     n_gpus_per_node: int = 8
 
+    # In standalone mode, place all rollout replicas in one shared STRICT_PACK placement group
+    # matching (nnodes, n_gpus_per_node) instead of giving each replica its own group. Keeps
+    # rollout confined to the requested nodes so co-running jobs can still find contiguous GPUs.
+    pack_standalone_replicas: bool = False
+
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0

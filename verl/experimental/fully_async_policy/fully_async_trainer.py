@@ -61,6 +61,12 @@ class TrainingStopException(Exception):
     pass
 
 
+class EmptyTrainingBatchException(Exception):
+    """Exception raised when filtering removes every trainable token in a batch."""
+
+    pass
+
+
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(SeparateRayPPOTrainer):
     """
@@ -144,6 +150,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.local_trigger_step = 1
         self.processed_samples = 0
         self.stale_trajectory_processed = 0
+        self.posneg_prompts_processed = 0.0
+        self.posneg_samples_processed = 0.0
+        self._last_posneg_metric_time: float | None = None
         self.current_param_version = 0
         self.total_train_steps = None
         self.progress_bar = None
@@ -585,6 +594,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         while True:
             try:
                 await self.fit_step()
+            except EmptyTrainingBatchException as e:
+                print(f"[FullyAsyncTrainer] Skip empty training batch: {e}")
+                continue
             except TrainingStopException:
                 print("[FullyAsyncTrainer] Training stopped by queue termination signal")
                 break
@@ -653,6 +665,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 with marked_timer("filter_zero_adv", timing_raw, color="grey"):
                     filter_metrics = mask_out_zero_variance_groups(batch)
                     metrics.update(filter_metrics)
+                    if filter_metrics.get("fully_async/filter_zero_adv/total_valid_tokens_after") == 0:
+                        raise EmptyTrainingBatchException(
+                            "all response_mask tokens were filtered out by filter_zero_adv"
+                        )
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 
@@ -766,7 +782,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Expand per-prompt tracking info to per-response level using rollout_ns.
         # rollout_ns[i] tells how many responses prompt i generated.
-        per_prompt_keys = ("prompt_uids", "pass_rates", "sample_counts", "sampling_probs")
+        per_prompt_keys = (
+            "prompt_uids",
+            "pass_rates",
+            "sample_counts",
+            "sampling_probs",
+            "positive_counts",
+            "stop_reasons",
+            "posneg_flags",
+        )
         rollout_ns = meta.get("rollout_ns", None)
 
         if rollout_ns is not None and isinstance(rollout_ns, list):
@@ -1392,7 +1416,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Collect metrics from samples
         """
         if hasattr(batch, "meta_info") and batch.meta_info:
-            trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
+            trajectory_param_versions = batch.meta_info.get(
+                "response_end_versions",
+                batch.meta_info["trajectory_param_versions"],
+            )
             stale_traj_count = sum(1 for v in trajectory_param_versions if self.current_param_version - v >= 1)
             self.stale_trajectory_processed += stale_traj_count
             metrics.update(
@@ -1405,13 +1432,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
 
-            # --- Policy staleness metrics ---
-            # Definition (per user): sequence staleness = current_param_version
-            # (the policy version being trained right now) minus the policy
-            # version at which the sequence started rolling out (min_global_steps).
-            # Prompt staleness aggregates per-response staleness within a prompt
-            # via ``max`` (default) or ``mean``; we then report mean/max across
-            # all prompts in the mini-batch and across all responses.
+            # --- Staleness metrics ---
+            # Match hytuner's naming:
+            #   prompt_staleness = current_param_version - prompt_start_version
+            #   response_staleness = current_param_version - response_end_version
+            # The old start-version policy drift is reported separately as
+            # policy_response_staleness_*.
             prompt_agg = getattr(self.config.actor_rollout_ref.rollout, "staleness_prompt_aggregation", "max")
             staleness_metrics = compute_staleness_metrics(
                 batch,
@@ -1421,4 +1447,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if staleness_metrics:
                 metrics.update(staleness_metrics)
 
+            # --- Stop-rule agnostic positive+negative effective sample metrics ---
+            # A prompt group is counted as posneg-effective when its completed
+            # responses contain at least one positive and at least one negative
+            # reward. This works for both fixed_rollout and has-pos-neg rules.
+            posneg_prompts = float(batch.meta_info.get("fully_async/posneg/prompts_per_step", 0.0))
+            posneg_samples = float(batch.meta_info.get("fully_async/posneg/samples_per_step", 0.0))
+            now = time.time()
+            if self._last_posneg_metric_time is None:
+                elapsed = float(self.timing_raw.get("gen", 0.0))
+            else:
+                elapsed = max(1e-6, now - self._last_posneg_metric_time)
+            self._last_posneg_metric_time = now
 
+            self.posneg_prompts_processed += posneg_prompts
+            self.posneg_samples_processed += posneg_samples
+            metrics.update(
+                {
+                    "fully_async/posneg/prompts_cum": self.posneg_prompts_processed,
+                    "fully_async/posneg/samples_cum": self.posneg_samples_processed,
+                    "fully_async/posneg/window_seconds": elapsed,
+                    "fully_async/posneg/prompts_per_sec": (
+                        posneg_prompts / elapsed if elapsed > 0 else 0.0
+                    ),
+                    "fully_async/posneg/samples_per_sec": (
+                        posneg_samples / elapsed if elapsed > 0 else 0.0
+                    ),
+                }
+            )

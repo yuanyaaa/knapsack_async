@@ -19,6 +19,8 @@ import dataclasses
 import json
 import logging
 import os
+import signal
+import threading
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -30,6 +32,25 @@ logger = logging.getLogger(__name__)
 
 MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
+
+
+def _call_with_timeout(func, *, timeout_seconds: float, operation: str):
+    """Run a blocking initialization call with a fail-fast timeout on Linux."""
+    if timeout_seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        return func()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def _handle_timeout(signum, frame):
+        raise TimeoutError(f"{operation} timed out after {timeout_seconds:g} seconds")
+
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return func()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 class Tracking:
@@ -122,25 +143,68 @@ class Tracking:
                         logger.warning("All MLflow initialization attempts failed. Proceeding without MLflow tracking.")
 
         if "swanlab" in default_backend:
+            import inspect
             import os
 
             import swanlab
 
-            SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
+            SWANLAB_API_KEY = os.environ.get("USER_SWANLAB_API_KEY", None) or os.environ.get("SWANLAB_API_KEY", None)
             SWANLAB_LOG_DIR = os.environ.get("SWANLAB_LOG_DIR", "swanlog")
             SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "cloud")
+            SWANLAB_WORKSPACE = os.environ.get("SWANLAB_WORKSPACE", None)
+            SWANLAB_INIT_TIMEOUT_SECONDS = float(os.environ.get("SWANLAB_INIT_TIMEOUT_SECONDS", "60"))
             if SWANLAB_API_KEY:
-                swanlab.login(SWANLAB_API_KEY)  # NOTE: previous login information will be overwritten
+                host = os.environ.get("SWANLAB_HOST") or os.environ.get("SWANLAB_API_HOST")
+                web_host = os.environ.get("SWANLAB_WEB_HOST")
+                if host:
+                    host = host.rstrip("/")
+                    if host.endswith("/api"):
+                        host = host[: -len("/api")]
+                # Taiji-managed Ray jobs inject this host; a self-started cluster does not.
+                login_kwargs = {
+                    "api_key": SWANLAB_API_KEY,
+                    "host": host,
+                    "web_host": web_host,
+                    "save": False,
+                }
+                login_params = inspect.signature(swanlab.login).parameters
+                login_kwargs = {
+                    key: value
+                    for key, value in login_kwargs.items()
+                    if key in login_params and (value is not None or key == "api_key")
+                }
+                has_proxy = any(
+                    os.environ.get(key)
+                    for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+                )
+                print(
+                    f"[Tracking] SwanLab login start: host={host}, workspace={SWANLAB_WORKSPACE}, "
+                    f"proxy_configured={has_proxy}",
+                    flush=True,
+                )
+                _call_with_timeout(
+                    lambda: swanlab.login(**login_kwargs),
+                    timeout_seconds=SWANLAB_INIT_TIMEOUT_SECONDS,
+                    operation=f"SwanLab login to {host}",
+                )
+                print("[Tracking] SwanLab login completed", flush=True)
 
             if config is None:
                 config = {}  # make sure config is not None, otherwise **config will raise error
-            swanlab.init(
-                project=project_name,
-                experiment_name=experiment_name,
-                config={"FRAMEWORK": "verl", **config},
-                logdir=SWANLAB_LOG_DIR,
-                mode=SWANLAB_MODE,
+            print("[Tracking] SwanLab run initialization start", flush=True)
+            _call_with_timeout(
+                lambda: swanlab.init(
+                    project=project_name,
+                    workspace=SWANLAB_WORKSPACE,
+                    experiment_name=experiment_name,
+                    config={"FRAMEWORK": "verl", **config},
+                    logdir=SWANLAB_LOG_DIR,
+                    mode=SWANLAB_MODE,
+                ),
+                timeout_seconds=SWANLAB_INIT_TIMEOUT_SECONDS,
+                operation="SwanLab run initialization",
             )
+            print("[Tracking] SwanLab run initialization completed", flush=True)
             self.logger["swanlab"] = swanlab
 
         if "vemlp_wandb" in default_backend:

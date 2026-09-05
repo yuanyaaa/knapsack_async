@@ -20,6 +20,7 @@
 | `fully_async/partial/*` | Trainer（batch 组装时） | batch 级 | Partial rollout（跨参数版本）统计 |
 | `fully_async/staleness/*` | Trainer（batch 组装后） | batch 级 | Response / Prompt 级参数版本 staleness |
 | `fully_async/prompt_buffer/*` | Trainer（batch 组装时） | batch 级 | Prompt buffer 侧的 pass_rate / 采样概率 / rollout_n 统计 |
+| `fully_async/posneg/*` | Trainer（batch 组装后） | step / 累计 / rate | 有正有负 prompt group 的有效样本速度 |
 | `fully_async/rejection_sampling/*` | Rollouter → Trainer | 累计量（`last` 聚合） | **Rejection Sampling 专属统计**（见 §4） |
 | `fully_async/pad/*` | Trainer | batch 级 | **Pad Samples 专属统计**（见 §5） |
 | `fully_async/purge/*` | Trainer（param sync 后） | 事件级（仅非零时上报） | **Queue 侧 stale item 清理统计**（见 §5.5） |
@@ -53,7 +54,40 @@
 
 ---
 
-## 3. `fully_async/partial/*` — Partial Rollout 统计
+## 3. `fully_async/posneg/*` — 有正有负有效样本指标
+
+该组指标不依赖 stop rule。无论当前使用 `fixed_rollout`、`has_at_least_positive_and_negative`，还是其他变长 rollout 规则，都会在 prompt group 完成并进入 trainer batch 后判断：
+
+```text
+posneg_prompt = positive_count > 0 and negative_count > 0
+negative_count = rollout_n - positive_count
+```
+
+| 指标 | 含义 |
+|---|---|
+| `fully_async/posneg/prompts_per_step` | 当前 trainer step 中，有正有负的 prompt group 数 |
+| `fully_async/posneg/samples_per_step` | 当前 trainer step 中，属于有正有负 prompt group 的 response 总数 |
+| `fully_async/posneg/prompt_ratio` | `prompts_per_step / batch_prompt_count` |
+| `fully_async/posneg/sample_ratio` | `samples_per_step / batch_sample_count` |
+| `fully_async/posneg/prompts_cum` | 从训练开始累计的有正有负 prompt group 数 |
+| `fully_async/posneg/samples_cum` | 从训练开始累计的有正有负 response 数 |
+| `fully_async/posneg/window_seconds` | 本次 rate 计算距离上次 rate 计算经过的 wall-clock 秒数 |
+| `fully_async/posneg/prompts_per_sec` | `prompts_per_step / window_seconds` |
+| `fully_async/posneg/samples_per_sec` | `samples_per_step / window_seconds` |
+
+推荐用于比较不同采样/stop rule 方法的核心曲线：
+
+```text
+fully_async/posneg/samples_per_sec
+fully_async/posneg/prompts_per_sec
+fully_async/posneg/sample_ratio
+```
+
+其中 `samples_per_sec` 更接近“每秒产生多少有训练信号的 response”，`prompts_per_sec` 更接近“每秒产生多少有训练信号的题目组”。
+
+---
+
+## 4. `fully_async/partial/*` — Partial Rollout 统计
 
 Partial rollout 指一条 sample 在生成过程中跨越了至少一次参数更新（`min_global_steps != max_global_steps`）。
 
@@ -65,7 +99,7 @@ Partial rollout 指一条 sample 在生成过程中跨越了至少一次参数�
 
 ---
 
-## 4. `fully_async/rejection_sampling/*` — Rejection Sampling 指标 ⭐
+## 5. `fully_async/rejection_sampling/*` — Rejection Sampling 指标 ⭐
 
 ### 4.1 机制简述
 
@@ -232,12 +266,15 @@ Trainer 每次 `get_batch` 消费后，返回结构中也会附带两个「消�
 
 由 `compute_staleness_metrics`（[detach_utils.py](/apdcephfs/share_302503006/ziniuli/project/verl-main/verl/experimental/fully_async_policy/detach_utils.py)）计算，反映 off-policy 程度。
 
-- Response 级 staleness = `current_param_version - min_global_steps`（该 response 开始生成时的参数版本）。
+- Prompt 级 staleness = `current_param_version - prompt_start_version`，对齐 hytuner 的 `current_step - start_version`。
+- Response 级 staleness = `current_param_version - response_end_version`，对齐 hytuner 的 `current_step - end_version`，表示 response 完成后到训练消费之间跨过的参数版本数。
+- 旧的“生成开始 policy 到训练 policy 的差值”保留为 `policy_response_staleness_*`。
 - Prompt 级 staleness = 同一 prompt 下多条 response staleness 的 `max`（默认）或 `mean` 聚合（由 `rollout_ns` 切片）。
 
 | 指标 | 含义 |
 |---|---|
-| `fully_async/staleness/response_staleness_mean` / `_max` / `_min` | Batch 内所有 response 级 staleness 的均值 / 最大 / 最小 |
+| `fully_async/staleness/response_staleness_mean` / `_max` / `_min` | Batch 内所有 response 完成后等待训练消费的 staleness 均值 / 最大 / 最小 |
+| `fully_async/staleness/policy_response_staleness_mean` / `_max` / `_min` | Batch 内所有 response 从开始生成 policy 到训练 policy 的版本差 |
 | `fully_async/staleness/response_rollout_span_mean` / `_max` | Rollout 过程中跨越的参数版本数 `max_global_steps - min_global_steps` 的均值 / 最大 |
 | `fully_async/staleness/prompt_staleness_mean` / `_max` / `_min` | Prompt 级（组内聚合后）staleness 统计 |
 
@@ -358,4 +395,3 @@ Trainer 每次 `get_batch` 消费后，返回结构中也会附带两个「消�
 | [message_queue.py](/apdcephfs/share_302503006/ziniuli/project/verl-main/verl/experimental/fully_async_policy/message_queue.py) `get_statistics` / `get_batch` 返回值 | 队列 size / pending / dropped（**未自动打点**，见 §5.6） |
 | [fully_async_rollouter.py](/apdcephfs/share_302503006/ziniuli/project/verl-main/verl/experimental/fully_async_policy/fully_async_rollouter.py) Rollouter 主循环 | `fully_async/count/*`, `fully_async/rollouter/*` |
 | [utils/batch_metrics.py](/apdcephfs/share_302503006/ziniuli/project/verl-main/verl/experimental/fully_async_policy/utils/batch_metrics.py) | `batch_analysis/*`（含 `raw_acc` / `unweighted_acc`） |
-

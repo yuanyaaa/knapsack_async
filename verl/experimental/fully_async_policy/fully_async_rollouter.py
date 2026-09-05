@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import multiprocessing
 import os
 import time
@@ -25,12 +26,17 @@ import numpy as np
 import ray
 import torch
 
+from verl import DataProto
 from verl.experimental.fully_async_policy.utils.async_prompt_buffer import (
     AsyncPromptBuffer,
     get_adaptive_rollout_n,
     resolve_prompt_sample_strategy,
 )
+from verl.experimental.fully_async_policy.utils.adaptive_debug import (
+    configure as configure_adaptive_debug,
+)
 from verl.experimental.fully_async_policy.utils.async_response_buffer import (
+    COMPENSATION_RULE_ROI_MAX,
     TRAIN_TRIGGER_FIXED_PROMPT,
     TRAIN_TRIGGER_FIXED_SAMPLES,
     AsyncResponseBuffer,
@@ -144,7 +150,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # ==================== AsyncPromptBuffer ====================
         # Always create AsyncPromptBuffer. ``sample_strategy`` is resolved in
         # ``resolve_prompt_sample_strategy`` (optional legacy ``priority_strategy`` in config):
-        # sequential (default), uniform random, or pass_rate-weighted priority.
+        # epoch-shuffled sequential (default), fixed-order sequential, uniform
+        # random, or pass_rate-weighted priority.
         #
         # NOTE: "rollout n per prompt" is decided by the rollouter side
         # (AsyncResponseBuffer + optional dynamic_fixed_n_provider reading
@@ -152,6 +159,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # ``async_training.rollout_config.*`` and are NOT forwarded here.
         async_training_cfg = config.async_training
         sample_strategy = resolve_prompt_sample_strategy(async_training_cfg)
+        _debug_cfg = async_training_cfg.get("rollout_config", {})
+        configure_adaptive_debug(
+            debug_adaptive_n=bool(_debug_cfg.get("debug_adaptive_n", False)),
+            debug_priority_sampling=bool(_debug_cfg.get("debug_priority_sampling", False)),
+            max_records_per_event=int(_debug_cfg.get("debug_max_records_per_event", 2000)),
+            sample_every=int(_debug_cfg.get("debug_sample_every", 200)),
+        )
         self.prompt_buffer = AsyncPromptBuffer(
             dataset=train_dataset,
             collate_fn=collate_fn,
@@ -320,28 +334,32 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # ``utils.async_prompt_buffer``. A single knob controls everything:
         #   adaptive_rollout_n_strategy: null / "" -> disabled (use static rollout.n as N)
         #                                "<name>"  -> enabled, dispatched via get_adaptive_rollout_n
-        # Only effective when stop_rule == "fixed_rollout".
+        # Only effective when stop_rule == "fixed_rollout" or stop rules that
+        # explicitly reuse the offline fixed-N target.
         _strategy_raw = rollout_cfg.get("adaptive_rollout_n_strategy", None)
         _strategy = str(_strategy_raw).strip() if _strategy_raw is not None else ""
         stop_rule = rollout_cfg.get("stop_rule", "fixed_rollout")
         # Static fixed_rollout threshold is locked to ``actor_rollout_ref.rollout.n``
         # (= GRPO group size). No separate config knob.
         _base_n = self._rollout_n
-        # Fail-fast: adaptive_rollout_n_strategy is only meaningful under
-        # stop_rule="fixed_rollout" (it overrides the static per-prompt N
-        # threshold). Under any other stop_rule the per-prompt sequence count
-        # is controlled by that rule itself (e.g. has_at_least_positive,
-        # prefixed_rollout, max_rollout), and silently ignoring the strategy
-        # would mask a real config error -- user sets a strategy, expects
-        # adaptive behavior, but gets static rollout.n with no warning.
-        if _strategy and stop_rule != "fixed_rollout":
+        # Fail-fast: adaptive_rollout_n_strategy is only meaningful under stop
+        # rules that consume the offline fixed-N target. Under any other rule
+        # the per-prompt sequence count is controlled by that rule itself, and
+        # silently ignoring the strategy would mask a real config error.
+        adaptive_fixed_n_stop_rules = {
+            "fixed_rollout",
+            "knapsack_value_compensate",
+            "offline_medium_focus_budget_compensate",
+        }
+        if _strategy and stop_rule not in adaptive_fixed_n_stop_rules:
             raise ValueError(
                 f"[FullyAsyncRollouter] Config conflict: "
                 f"adaptive_rollout_n_strategy='{_strategy}' is only supported when "
-                f"stop_rule='fixed_rollout', but got stop_rule='{stop_rule}'. "
+                f"stop_rule is one of {sorted(adaptive_fixed_n_stop_rules)}, "
+                f"but got stop_rule='{stop_rule}'. "
                 f"Either set adaptive_rollout_n_strategy=null to use the static "
                 f"per-prompt sequence count defined by stop_rule='{stop_rule}', "
-                f"or switch stop_rule to 'fixed_rollout' to enable the adaptive strategy."
+                f"or switch stop_rule to an adaptive fixed-N rule."
             )
         # Global hard cap on sequences per prompt. Used (a) as the buffer-layer
         # hard cap for *every* stop_rule, and (b) as the adaptive-strategy
@@ -349,27 +367,62 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # and there is no way for the strategy to return a value above the
         # buffer's hard cap.
         _hard_max_n = int(rollout_cfg.get("max_rollout_n", 32))
+        _rollout_chunk_size = max(1, int(rollout_cfg.get("rollout_chunk_size", 1)))
+        _base_min_rollout_n = int(rollout_cfg.get("min_rollout_n", 1))
+        _min_n_schedule_interval = int(rollout_cfg.get("min_rollout_n_schedule_interval", 0) or 0)
+        _min_n_schedule_increment = int(rollout_cfg.get("min_rollout_n_schedule_increment", 0) or 0)
+
+        def _scheduled_min_rollout_n(
+            _base_min=_base_min_rollout_n,
+            _max=_hard_max_n,
+            _interval=_min_n_schedule_interval,
+            _increment=_min_n_schedule_increment,
+        ) -> int:
+            if _interval <= 0 or _increment == 0:
+                return max(1, min(int(_base_min), int(_max)))
+            stages = max(0, int(self.current_param_version) // int(_interval))
+            return max(1, min(int(_base_min) + stages * int(_increment), int(_max)))
+
         dynamic_provider = None
-        if _strategy and stop_rule == "fixed_rollout":
-            _hard_min_n = int(rollout_cfg.get("min_rollout_n", 2))
+        use_buffer_medium_focus = (
+            stop_rule == "offline_medium_focus_budget_compensate"
+            and _strategy == "medium_focus"
+        )
+        if _strategy and stop_rule in adaptive_fixed_n_stop_rules and not use_buffer_medium_focus:
+            _hard_min_n = _base_min_rollout_n
 
             def _dynamic_fixed_n(
                 prompt_uid: str,
                 _base=_base_n,
-                _min=_hard_min_n,
                 _max=_hard_max_n,
                 _strat=_strategy,
+                _peak=int(rollout_cfg.get("medium_focus_peak_n", _hard_max_n)),
             ) -> int:
                 meta = self.prompt_buffer.meta_data.get(prompt_uid, {})
                 pr = float(meta.get("pass_rate", 0.5))
-                return get_adaptive_rollout_n(pr, _base, min_n=_min, max_n=_max, strategy=_strat)
+                _min = _scheduled_min_rollout_n()
+                target_max = max(_min, min(_peak, _max)) if _strat == "medium_focus" else _max
+                target = get_adaptive_rollout_n(pr, _base, min_n=_min, max_n=target_max, strategy=_strat)
+                target = int(math.floor(float(target)))
+                return max(_min, min(target, _max))
 
             dynamic_provider = _dynamic_fixed_n
             print(
                 f"[FullyAsyncRollouter] adaptive_rollout_n ENABLED: "
-                f"strategy='{_strategy}', base_n={_base_n}, min_n={_hard_min_n}, max_n={_hard_max_n} "
+                f"strategy='{_strategy}', base_n={_base_n}, min_n={_hard_min_n}, "
+                f"max_n={_hard_max_n}, medium_focus_peak_n={int(rollout_cfg.get('medium_focus_peak_n', _base_n))}, "
+                f"min_n_schedule_interval={_min_n_schedule_interval}, "
+                f"min_n_schedule_increment={_min_n_schedule_increment}, "
+                f"integer_floor=True "
                 f"(shared with buffer-level max_rollout_n). "
                 f"per-prompt N will be computed dynamically from pass_rate."
+            )
+        elif use_buffer_medium_focus:
+            print(
+                "[FullyAsyncRollouter] adaptive_rollout_n delegated to response buffer: "
+                f"stop_rule={stop_rule}, strategy='{_strategy}', "
+                f"medium_focus_peak_n={int(rollout_cfg.get('medium_focus_peak_n', _base_n))}, "
+                f"max_rollout_n={_hard_max_n}"
             )
 
         _min_positive_k = (
@@ -377,13 +430,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if stop_rule == "has_at_least_positive"
             else 1
         )
+        _min_rollout_n = _base_min_rollout_n
+        (
+            self.pos_neg_ratio_enabled,
+            self.target_positive_count,
+            self.target_negative_count,
+        ) = self._parse_pos_neg_ratio_config(
+            rollout_cfg=rollout_cfg,
+            final_n=self._rollout_n,
+        )
+        self.rollout_chunk_size = max(
+            1,
+            int(rollout_cfg.get("rollout_chunk_size", 2)),
+        )
+
+        def _prompt_pass_rate(prompt_uid: str) -> float:
+            meta = self.prompt_buffer.meta_data.get(prompt_uid, {})
+            return float(meta.get("pass_rate", 0.5))
+
         self.response_buffer: AsyncResponseBuffer = AsyncResponseBuffer(
             stop_rule=stop_rule,
             fixed_rollout_n=_base_n,
             max_rollout_n=_hard_max_n,
+            min_rollout_n=_min_rollout_n,
             min_positive_k=_min_positive_k,
+            target_positive_count=self.target_positive_count,
+            target_negative_count=self.target_negative_count,
+            continue_on_mixed_chunk_size=self.rollout_chunk_size,
+            adaptive_chunk_alpha=float(rollout_cfg.get("adaptive_chunk_alpha", 0.5)),
+            adaptive_mixed_target_prob=float(rollout_cfg.get("adaptive_mixed_target_prob", 0.85)),
+            adaptive_chunk_prior_tau=float(rollout_cfg.get("adaptive_chunk_prior_tau", 8.0)),
+            adaptive_chunk_target_strategy=rollout_cfg.get("adaptive_chunk_target_strategy", "medium_focus_plateau"),
+            medium_focus_peak_n=int(rollout_cfg.get("medium_focus_peak_n", _base_n)),
+            compensation_bank_max=int(rollout_cfg.get("compensation_bank_max", 8)),
+            compensation_chunk_size=int(rollout_cfg.get("compensation_chunk_size", 1)),
+            compensation_save_n=int(rollout_cfg.get("compensation_save_n", 4)),
+            compensation_save_low=float(rollout_cfg.get("compensation_save_low", 0.4)),
+            compensation_save_high=float(rollout_cfg.get("compensation_save_high", 0.6)),
+            compensation_roi_threshold=float(rollout_cfg.get("compensation_roi_threshold", 1.5)),
+            compensation_rule=rollout_cfg.get("compensation_rule", COMPENSATION_RULE_ROI_MAX),
+            compensation_rescue_prob=float(rollout_cfg.get("compensation_rescue_prob", 0.85)),
+            compensation_minority_target=int(rollout_cfg.get("compensation_minority_target", 1)),
+            compensation_estimate_clip=float(rollout_cfg.get("compensation_estimate_clip", 0.02)),
+            compensation_budget_baseline_n=int(rollout_cfg.get("compensation_budget_baseline_n", _base_n)),
+            compensation_budget_window_size=int(rollout_cfg.get("compensation_budget_window_size", 0)),
             train_trigger=rollout_cfg.get("train_trigger", TRAIN_TRIGGER_FIXED_PROMPT),
             dynamic_fixed_n_provider=dynamic_provider,
+            prompt_pass_rate_provider=_prompt_pass_rate,
+            min_rollout_n_provider=_scheduled_min_rollout_n,
         )
         # Event used to signal the feed task that: (a) a prompt has just been
         # emitted (live-prompt count decreased, drain may be finished), or
@@ -393,7 +487,27 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         print(
             f"[FullyAsyncRollouter] rollout_config: stop_rule={stop_rule}, "
             f"pure_streaming=True (working_pool_size removed), "
-            f"fixed_rollout_n=rollout.n={_base_n}"
+            f"fixed_rollout_n=rollout.n={_base_n}, "
+            f"min_rollout_n={_min_rollout_n}, "
+            f"min_rollout_n_schedule_interval={_min_n_schedule_interval}, "
+            f"min_rollout_n_schedule_increment={_min_n_schedule_increment}, "
+            f"rollout_chunk_size={self.rollout_chunk_size}, "
+            f"pos_neg_ratio_enabled={self.pos_neg_ratio_enabled}, "
+            f"target_positive_count={self.target_positive_count}, "
+            f"target_negative_count={self.target_negative_count}, "
+            f"adaptive_chunk_alpha={float(rollout_cfg.get('adaptive_chunk_alpha', 0.5))}, "
+            f"adaptive_mixed_target_prob={float(rollout_cfg.get('adaptive_mixed_target_prob', 0.85))}, "
+            f"adaptive_chunk_prior_tau={float(rollout_cfg.get('adaptive_chunk_prior_tau', 8.0))}, "
+            f"adaptive_chunk_target_strategy={rollout_cfg.get('adaptive_chunk_target_strategy', 'medium_focus_plateau')}, "
+            f"medium_focus_peak_n={int(rollout_cfg.get('medium_focus_peak_n', _base_n))}, "
+            f"compensation_bank_max={int(rollout_cfg.get('compensation_bank_max', 8))}, "
+            f"compensation_chunk_size={int(rollout_cfg.get('compensation_chunk_size', 1))}, "
+            f"compensation_save_n={int(rollout_cfg.get('compensation_save_n', 4))}, "
+            f"compensation_save_range=[{float(rollout_cfg.get('compensation_save_low', 0.4))}, "
+            f"{float(rollout_cfg.get('compensation_save_high', 0.6))}], "
+            f"compensation_roi_threshold={float(rollout_cfg.get('compensation_roi_threshold', 1.5))}, "
+            f"compensation_budget_baseline_n={int(rollout_cfg.get('compensation_budget_baseline_n', _base_n))}, "
+            f"compensation_budget_window_size={int(rollout_cfg.get('compensation_budget_window_size', 0))}"
         )
 
         # ==================== Rejection Sampling (rollouter-side) ====================
@@ -422,11 +536,68 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self._rejection_reward_info: list[tuple[int, int, float]] = []
         # Lock to protect the above mutable state across coroutines.
         self._rejection_lock: asyncio.Lock | None = None
+        self._pos_neg_ratio_stats: dict[str, int] = {
+            "total_prompts_seen": 0,
+            "accepted_prompts": 0,
+            "rejected_prompts": 0,
+            "total_raw_samples_seen": 0,
+            "accepted_samples": 0,
+            "rejected_raw_samples": 0,
+        }
         if self.rejection_sampling_enabled:
             print(
                 "[FullyAsyncRollouter] rejection_sampling: ENABLED "
                 "(solve_all / solve_none samples are dropped before queueing)."
             )
+
+    @staticmethod
+    def _parse_pos_neg_ratio_config(rollout_cfg: dict, final_n: int) -> tuple[bool, int, int]:
+        """Parse optional fixed positive:negative counts for emitted groups.
+
+        ``positive_negative_ratio=1:7`` means exactly 1 positive and 7 negative
+        responses will be emitted for each accepted prompt. The two counts must
+        sum to ``final_n`` so the trainer-side batch shape stays fixed.
+        """
+        raw = (
+            rollout_cfg.get("positive_negative_ratio", None)
+            or rollout_cfg.get("pos_neg_ratio", None)
+            or ""
+        )
+        raw = str(raw).strip()
+        if not raw or raw.lower() in {"none", "null", "false", "0"}:
+            return False, 0, 0
+
+        normalized = raw.replace(",", ":")
+        parts = [p.strip() for p in normalized.split(":") if p.strip()]
+        if len(parts) != 2:
+            raise ValueError(
+                "[FullyAsyncRollouter] positive_negative_ratio must be formatted like '1:7', "
+                f"got {raw!r}."
+            )
+        pos_ratio, neg_ratio = (int(parts[0]), int(parts[1]))
+        if pos_ratio < 0 or neg_ratio < 0 or pos_ratio + neg_ratio <= 0:
+            raise ValueError(
+                "[FullyAsyncRollouter] positive_negative_ratio counts must be non-negative "
+                f"and not both zero, got {raw!r}."
+            )
+
+        final_n = int(final_n)
+        if final_n <= 0:
+            raise ValueError(f"[FullyAsyncRollouter] final_n must be positive, got {final_n}.")
+
+        target_pos, target_neg = pos_ratio, neg_ratio
+        if target_pos + target_neg != final_n:
+            raise ValueError(
+                "[FullyAsyncRollouter] positive_negative_ratio is interpreted as fixed "
+                f"counts and must sum to final_n={final_n}, got {raw!r}."
+            )
+
+        print(
+            "[FullyAsyncRollouter] positive_negative_ratio ENABLED: "
+            f"raw={raw!r}, final_n={final_n}, target={target_pos}:{target_neg}",
+            flush=True,
+        )
+        return True, int(target_pos), int(target_neg)
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -731,7 +902,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), (
-                f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+                f"{key_info}: len(lst)={len(lst)}, len(sample_scores)={len(sample_scores)}"
             )
 
         if merged:
@@ -993,6 +1164,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Draw a fresh prompt from the AsyncPromptBuffer (prompt-side sampling).
             async with self.dataloader_lock:
+                self.prompt_buffer.set_training_step(self.current_param_version)
                 batch_dict, prompt_uid, sampling_prob = self.prompt_buffer.get_single_sample()
 
             # Avoid duplicate active prompt_uid (same uid rolled out concurrently would
@@ -1007,7 +1179,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             _resample_consecutive = 0
 
-            # Register in response buffer and submit ONE sequence job.
+            # Register in response buffer and submit the first generation job.
             # Stamp the prompt's birth param version so we can compute its
             # prompt-level staleness later.
             self.response_buffer.register_prompt(
@@ -1015,21 +1187,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 sampling_prob=sampling_prob,
                 start_param_version=self.current_param_version,
             )
-            self.response_buffer.on_job_submitted(prompt_uid)
+            repeat_times = self._next_response_request_size(prompt_uid)
 
             # ---- Back-pressure gate 3: concurrency cap ----
-            # Wait until there is room before dispatching.
-            while len(self.active_tasks) >= self.max_concurrent_samples:
-                if not self.active_tasks:
-                    break
-                done_tasks, _ = await asyncio.wait(
-                    self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done_tasks:
-                    await task
+            # Cap real responses rather than coroutine count: one generation
+            # task may carry the full fixed/offline target N.
+            await self._wait_for_response_slots(repeat_times)
+            for _ in range(repeat_times):
+                self.response_buffer.on_job_submitted(prompt_uid)
 
-            # Dispatch the first sequence task directly (no queue).
-            self._submit_one_response_job(prompt_uid, batch_dict, sampling_prob)
+            # Dispatch the first generation task directly (no queue).
+            self._submit_one_response_job(
+                prompt_uid,
+                batch_dict,
+                sampling_prob,
+                repeat_times=repeat_times,
+            )
 
         print(
             f"[FullyAsyncRollouter][Feed] reached total_rollout_steps: "
@@ -1095,10 +1268,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             self.feed_task = None
 
-            # Send a finish signal. The end-of-stream sentinel carries no real
-            # samples, so pass ``n_samples=0`` to keep the queue's
-            # pending_samples counter exact.
-            await self.message_queue_client.put_sample(sample=None, n_samples=0)
+            # Tell the trainer-side consumer that rollout production is over.
+            # A zero-sample sentinel is not enough in fixed-samples mode:
+            # MessageQueue.get_batch waits on pending_samples >= target, so a
+            # n_samples=0 item can leave the trainer blocked forever.
+            await self.message_queue_client.shutdown()
 
         async with self.lock:
             self.running = False
@@ -1261,18 +1435,209 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             stats["rejection/rejected_solve_all_samples"] = self._rejection_stats["rejected_solve_all_samples"]
             stats["rejection/rejected_solve_none_samples"] = self._rejection_stats["rejected_solve_none_samples"]
 
+        if self.pos_neg_ratio_enabled:
+            stats["pos_neg_ratio/enabled"] = 1
+            stats["pos_neg_ratio/target_positive"] = self.target_positive_count
+            stats["pos_neg_ratio/target_negative"] = self.target_negative_count
+            stats["pos_neg_ratio/total_prompts_seen"] = self._pos_neg_ratio_stats["total_prompts_seen"]
+            stats["pos_neg_ratio/accepted_prompts"] = self._pos_neg_ratio_stats["accepted_prompts"]
+            stats["pos_neg_ratio/rejected_prompts"] = self._pos_neg_ratio_stats["rejected_prompts"]
+            total_seen = max(1, self._pos_neg_ratio_stats["total_prompts_seen"])
+            stats["pos_neg_ratio/accepted_prompt_ratio"] = (
+                self._pos_neg_ratio_stats["accepted_prompts"] / total_seen
+            )
+            stats["pos_neg_ratio/rejected_prompt_ratio"] = (
+                self._pos_neg_ratio_stats["rejected_prompts"] / total_seen
+            )
+            stats["pos_neg_ratio/total_raw_samples_seen"] = self._pos_neg_ratio_stats[
+                "total_raw_samples_seen"
+            ]
+            stats["pos_neg_ratio/accepted_samples"] = self._pos_neg_ratio_stats["accepted_samples"]
+            stats["pos_neg_ratio/rejected_raw_samples"] = self._pos_neg_ratio_stats[
+                "rejected_raw_samples"
+            ]
+
         return stats
 
     # =====================================================================
     # Streaming per-sequence rollout with per-prompt stop rule
     # =====================================================================
 
-    def _submit_one_response_job(self, prompt_uid: str, batch_dict: dict, sampling_prob: float):
-        """Prepare a single-sequence (repeat_times=1) job and dispatch it
-        directly as an asyncio task.
+    async def _wait_for_response_slots(self, request_size: int) -> None:
+        """Wait until dispatching ``request_size`` responses fits the cap.
+
+        ``active_tasks`` counts generation requests, but one request can carry
+        multiple responses. The cap is therefore enforced against the response
+        buffer's real in-flight response count. An oversized request is allowed
+        only when no other responses are in flight, which avoids deadlock when
+        a configured target N is larger than the cap.
+        """
+        request_size = max(1, int(request_size))
+        while True:
+            in_flight = self.response_buffer.num_in_flight_samples()
+            if in_flight == 0 or in_flight + request_size <= self.max_concurrent_samples:
+                return
+
+            current_task = asyncio.current_task()
+            waitable_tasks = {
+                task for task in self.active_tasks
+                if task is not current_task
+            }
+            if not waitable_tasks:
+                return
+
+            done_tasks, _ = await asyncio.wait(
+                waitable_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done_tasks:
+                await task
+
+    def _next_response_request_size(self, prompt_uid: str) -> int:
+        """Return how many sequences to request in the next generation call."""
+        state = self.response_buffer.get_state(prompt_uid)
+        if state is None:
+            return 1
+
+        target_n = int(self.response_buffer.max_rollout_n)
+        rule = self.response_buffer.stop_rule
+        if rule == "fixed_rollout":
+            target_n = int(self.response_buffer._resolve_fixed_n(prompt_uid))
+        elif rule == "prefixed_rollout":
+            p = max(float(state.sampling_prob), 1e-8)
+            target_n = min(target_n, int(math.ceil(1.0 / p)))
+        elif rule == "offline_medium_focus_compensate":
+            if state.target_n is not None:
+                target_n = int(state.target_n)
+            else:
+                target_n = int(
+                    self.response_buffer._resolve_offline_medium_focus_compensate_target_n(
+                        prompt_uid,
+                        state,
+                    )
+                )
+        elif rule == "offline_medium_focus_budget_compensate":
+            if state.target_n is not None:
+                target_n = int(state.target_n)
+            else:
+                target_n = int(
+                    self.response_buffer._resolve_offline_medium_focus_budget_target_n(
+                        prompt_uid,
+                        state,
+                    )
+                )
+        elif rule == "knapsack_value_compensate":
+            target_n = int(self.response_buffer._resolve_fixed_n(prompt_uid))
+            if state.target_n is not None:
+                target_n = int(state.target_n)
+
+        remaining = max(1, target_n - int(state.num_finished))
+        # These rules know their target before dispatch. Send the full initial
+        # target in one request; if compensation later raises target_n, send
+        # that complete extra grant in one follow-up request. Chunking is only
+        # useful for rules that inspect intermediate responses to early-stop.
+        if rule in {
+            "fixed_rollout",
+            "offline_medium_focus_compensate",
+            "offline_medium_focus_budget_compensate",
+        }:
+            return remaining
+        return max(1, min(int(self.rollout_chunk_size), remaining))
+
+    @staticmethod
+    def _slice_dataproto_with_single_metric(batch, idx: int):
+        """Slice a DataProto to one row and keep per-row agent-loop metrics aligned."""
+        single = batch[idx : idx + 1]
+        metrics = batch.meta_info.get("metrics", None)
+        if metrics is None:
+            return single
+
+        single.meta_info = dict(single.meta_info)
+        if isinstance(metrics, list) and len(metrics) == len(batch):
+            single.meta_info["metrics"] = [metrics[idx]]
+        elif isinstance(metrics, dict):
+            sliced_metrics = {}
+            for key, value in metrics.items():
+                if isinstance(value, list) and len(value) == len(batch):
+                    sliced_metrics[key] = [value[idx]]
+                else:
+                    sliced_metrics[key] = value
+            single.meta_info["metrics"] = sliced_metrics
+        return single
+
+    @staticmethod
+    def _align_non_tensor_field_to_batch(value, target_len: int, key: str):
+        """Align a preserved non-tensor field to a generated batch length."""
+        arr = np.asarray(value, dtype=object)
+        if arr.shape[0] == target_len:
+            return arr
+        if arr.shape[0] == 1:
+            return np.repeat(arr, target_len, axis=0)
+        print(
+            f"[FullyAsyncRollouter] preserved field {key!r} length {arr.shape[0]} "
+            f"does not match generated length {target_len}; trimming to the generated length.",
+            flush=True,
+        )
+        return arr[:target_len]
+
+    def _slice_dataproto_with_indices(self, batch, indices: list[int], prompt_uid: str):
+        """Select exact response indices and keep per-response metadata aligned."""
+        selected_parts = [self._slice_dataproto_with_single_metric(batch, idx) for idx in indices]
+        selected = DataProto.concat(selected_parts)
+        expected_len = len(indices)
+
+        metrics = selected.meta_info.get("metrics", None)
+        if isinstance(metrics, dict):
+            normalized_metrics = {}
+            for key, value in metrics.items():
+                if isinstance(value, list) and all(
+                    isinstance(item, (list, tuple)) and len(item) == 1 for item in value
+                ):
+                    normalized_metrics[key] = [item[0] for item in value]
+                else:
+                    normalized_metrics[key] = value
+            selected.meta_info = dict(selected.meta_info)
+            selected.meta_info["metrics"] = normalized_metrics
+            metrics = normalized_metrics
+
+        problems = []
+        if len(selected) != expected_len:
+            problems.append(f"batch_len={len(selected)} expected={expected_len}")
+
+        for key, value in selected.non_tensor_batch.items():
+            if not isinstance(value, np.ndarray):
+                problems.append(f"{key}: non-array {type(value).__name__}")
+                continue
+            if value.shape[0] != expected_len:
+                problems.append(f"{key}: shape={value.shape} expected_dim0={expected_len}")
+
+        if isinstance(metrics, dict):
+            for key, value in metrics.items():
+                if isinstance(value, list) and len(value) != expected_len:
+                    problems.append(f"metrics.{key}: len={len(value)} expected={expected_len}")
+        elif isinstance(metrics, list) and len(metrics) != expected_len:
+            problems.append(f"metrics: len={len(metrics)} expected={expected_len}")
+
+        if problems:
+            raise ValueError(
+                f"selected DataProto for prompt_uid={prompt_uid} is not aligned after "
+                f"indices={indices}: " + "; ".join(problems)
+            )
+
+        return selected
+
+    def _submit_one_response_job(
+        self,
+        prompt_uid: str,
+        batch_dict: dict,
+        sampling_prob: float,
+        repeat_times: int = 1,
+    ):
+        """Prepare a generation job and dispatch it directly as an asyncio task.
 
         Caller is responsible for calling response_buffer.on_job_submitted()
-        BEFORE calling this method, so that the in-flight counter is accurate.
+        once per requested sequence BEFORE calling this method, so that the
+        in-flight counter is accurate.
 
         NOTE: this helper does NOT advance self.global_steps. Since
         `total_rollout_steps` is sequence-level, `global_steps` is advanced by
@@ -1280,7 +1645,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         of whether the sequence belongs to a freshly drawn prompt or to a
         continue-rollout of an existing prompt.
         """
-        full_batch = prepare_single_generation_data(batch_dict, self.config, repeat_times=1)
+        repeat_times = max(1, int(repeat_times))
+        full_batch = prepare_single_generation_data(batch_dict, self.config, repeat_times=repeat_times)
         # `global_steps` is now sequence-level; convert to (approximate) epoch
         # by dividing by ``#prompts * rollout.n`` so the value stays consistent
         # with the dataloader's pass over the dataset.
@@ -1293,7 +1659,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             rollout_status={},
             prompt_uid=prompt_uid,
             sampling_prob=sampling_prob,
-            rollout_n=1,
+            rollout_n=repeat_times,
         )
         safe_create_task(
             self._process_one_response(rollout_sample),
@@ -1302,7 +1668,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
 
     async def _process_one_response(self, rollout_sample: "RolloutSample"):
-        """Processor body: generates ONE sequence, records it in the response
+        """Processor body: generates one or more sequences, records them in the response
         buffer, and either:
           * submits another sequence job for the same prompt_uid (continue), or
           * aggregates all finished sequences and emits a single RolloutSample (stop).
@@ -1338,28 +1704,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
         rollout_sample.full_batch = ret
 
+        generated_len = len(rollout_sample.full_batch)
         for key, val in preserved_fields.items():
             if key not in rollout_sample.full_batch.non_tensor_batch:
-                rollout_sample.full_batch.non_tensor_batch[key] = val
+                rollout_sample.full_batch.non_tensor_batch[key] = (
+                    self._align_non_tensor_field_to_batch(val, generated_len, key)
+                )
 
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{prompt_uid}"] * len(rollout_sample.full_batch), dtype=object
         )
 
-        # Extract per-sequence reward. rm_scores shape: [1, response_length].
-        reward = 0.0
+        # Extract per-sequence rewards and record each generated sequence in
+        # the response buffer. One generation request may contain multiple
+        # sequences to reduce per-request scheduling overhead.
+        finished_count = len(rollout_sample.full_batch)
+        rewards = [0.0] * finished_count
         try:
             if "rm_scores" in rollout_sample.full_batch.batch.keys():
-                reward = float(rollout_sample.full_batch.batch["rm_scores"].sum(dim=-1).item())
+                rewards_tensor = rollout_sample.full_batch.batch["rm_scores"].sum(dim=-1)
+                rewards = [float(x.item()) for x in rewards_tensor]
         except Exception as e:
             print(f"[FullyAsyncRollouter] Failed to extract reward for {prompt_uid}: {e}")
 
-        # Record in response buffer.
-        self.response_buffer.on_response_finished(
-            prompt_uid=prompt_uid,
-            sequence=rollout_sample.full_batch,
-            reward=reward,
+        state_for_versions = self.response_buffer.get_state(prompt_uid)
+        prompt_start_version = (
+            int(state_for_versions.start_param_version)
+            if state_for_versions is not None
+            else int(self.current_param_version)
         )
+        async with self.lock:
+            response_end_version = int(self.current_param_version)
+
+        rollout_sample.full_batch.non_tensor_batch["prompt_start_version"] = np.array(
+            [prompt_start_version] * finished_count,
+            dtype=np.int64,
+        )
+        rollout_sample.full_batch.non_tensor_batch["response_end_version"] = np.array(
+            [response_end_version] * finished_count,
+            dtype=np.int64,
+        )
+
+        for idx, reward in enumerate(rewards):
+            sequence = self._slice_dataproto_with_single_metric(rollout_sample.full_batch, idx)
+            self.response_buffer.on_response_finished(
+                prompt_uid=prompt_uid,
+                sequence=sequence,
+                reward=reward,
+            )
 
         # Only count sequences whose prompt was born under an older parameter
         # version as "stale". A sequence whose start_param_version ==
@@ -1370,8 +1762,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if state_for_staleness is not None and (
                 self.current_param_version > state_for_staleness.start_param_version
             ):
-                self.stale_samples += 1
-            self.global_steps += 1
+                self.stale_samples += finished_count
+            self.global_steps += finished_count
 
         # Decide: stop & emit, or continue with one more sequence.
         state = self.response_buffer.get_state(prompt_uid)
@@ -1381,11 +1773,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Submit another sequence job for the same prompt_uid.
             try:
                 batch_dict = self._materialize_batch_dict_for_uid(prompt_uid)
-                self.response_buffer.on_job_submitted(prompt_uid)
+                repeat_times = self._next_response_request_size(prompt_uid)
+                await self._wait_for_response_slots(repeat_times)
+                for _ in range(repeat_times):
+                    self.response_buffer.on_job_submitted(prompt_uid)
                 self._submit_one_response_job(
                     prompt_uid=prompt_uid,
                     batch_dict=batch_dict,
                     sampling_prob=state.sampling_prob if state else 0.0,
+                    repeat_times=repeat_times,
                 )
             except Exception as e:
                 print(
@@ -1397,7 +1793,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 # Without this, in_flight stays > 0 and mark_if_complete will
                 # never succeed, leaking the prompt from the working pool.
                 if state is not None:
-                    state.in_flight = max(0, state.in_flight - 1)
+                    state.in_flight = max(0, state.in_flight - int(locals().get("repeat_times", 1)))
                     state.stopped = True
                 should_stop = True
 
@@ -1445,6 +1841,42 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         sample["pass_rate"] = meta.get("pass_rate", 0.5)
         return pb.collate_fn([sample])
 
+    def _select_pos_neg_ratio_indices(
+        self,
+        rewards: list[float],
+        prompt_uid: str,
+    ) -> tuple[list[int] | None, str]:
+        """Select indices matching the configured positive:negative target.
+
+        Returns (indices, reason). ``indices is None`` means the prompt should
+        be dropped because it cannot satisfy the requested composition.
+        """
+        if not self.pos_neg_ratio_enabled:
+            return list(range(len(rewards))), "disabled"
+
+        positive_indices = [idx for idx, reward in enumerate(rewards) if reward > 0]
+        negative_indices = [idx for idx, reward in enumerate(rewards) if reward <= 0]
+        if (
+            len(positive_indices) < self.target_positive_count
+            or len(negative_indices) < self.target_negative_count
+        ):
+            return None, "insufficient_pos_neg"
+
+        # Deterministic shuffle per prompt to avoid positional bias while
+        # keeping resumed/replayed runs stable enough for debugging.
+        seed = 0
+        for ch in str(prompt_uid):
+            seed = (seed * 131 + ord(ch)) % (2**32)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(positive_indices)
+        rng.shuffle(negative_indices)
+        selected = (
+            positive_indices[: self.target_positive_count]
+            + negative_indices[: self.target_negative_count]
+        )
+        selected.sort()
+        return selected, "selected"
+
     async def _emit_prompt_as_rollout_sample(self, prompt_uid: str):
         """Aggregate all finished sequences of ``prompt_uid`` into a single
         RolloutSample (length = actual_n) and push it onto the message queue.
@@ -1476,12 +1908,82 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Compute (correct_count, total_count) from the aggregated rm_scores.
         correct_count = 0
         total_count = state.num_finished
+        raw_correct_count = 0
+        raw_total_count = total_count
+        reward_values = list(state.rewards)
         try:
             if "rm_scores" in aggregated.batch.keys():
                 _rs = aggregated.batch["rm_scores"].sum(dim=-1)  # [num_finished]
                 correct_count = int((_rs > 0).sum().item())
+                reward_values = [float(x.item()) for x in _rs]
         except Exception as e:
             print(f"[FullyAsyncRollouter] Failed to extract rm_scores for {prompt_uid}: {e}")
+        raw_correct_count = correct_count
+
+        stop_reason = "other"
+        if self.response_buffer.stop_rule == "has_at_least_positive":
+            if self.pos_neg_ratio_enabled and (
+                raw_correct_count >= self.target_positive_count
+                and (raw_total_count - raw_correct_count) >= self.target_negative_count
+            ):
+                stop_reason = "reached_ratio"
+            elif correct_count >= self.response_buffer.min_positive_k:
+                stop_reason = "reached_k"
+            elif total_count >= self.response_buffer.max_rollout_n:
+                stop_reason = "hit_max"
+        elif total_count >= self.response_buffer.max_rollout_n:
+            stop_reason = "hit_max"
+        elif getattr(state, "compensation_granted", False):
+            stop_reason = "compensated"
+
+        self.response_buffer.record_completed_prompt_stats(state)
+
+        selected_indices, pos_neg_select_reason = self._select_pos_neg_ratio_indices(
+            reward_values,
+            prompt_uid,
+        )
+        if self.pos_neg_ratio_enabled:
+            self._pos_neg_ratio_stats["total_prompts_seen"] += 1
+            self._pos_neg_ratio_stats["total_raw_samples_seen"] += raw_total_count
+
+        if selected_indices is None:
+            self.rejected_prompts += 1
+            self.rejected_samples += raw_total_count
+            self._pos_neg_ratio_stats["rejected_prompts"] += 1
+            self._pos_neg_ratio_stats["rejected_raw_samples"] += raw_total_count
+            if self._pos_neg_ratio_stats["total_prompts_seen"] % 16 == 0:
+                print(
+                    f"[FullyAsyncRollouter][PosNegRatio] Rejected {prompt_uid} "
+                    f"({pos_neg_select_reason}); raw_positive={raw_correct_count}, "
+                    f"raw_negative={raw_total_count - raw_correct_count}, "
+                    f"target={self.target_positive_count}:{self.target_negative_count}, "
+                    f"stats={self._pos_neg_ratio_stats}",
+                    flush=True,
+                )
+            return
+
+        if self.pos_neg_ratio_enabled:
+            try:
+                aggregated = self._slice_dataproto_with_indices(
+                    aggregated,
+                    selected_indices,
+                    prompt_uid,
+                )
+            except Exception as e:
+                print(f"[FullyAsyncRollouter] Pos/neg DataProto selection failed for {prompt_uid}: {e}")
+                self.rejected_prompts += 1
+                self.rejected_samples += raw_total_count
+                self._pos_neg_ratio_stats["rejected_prompts"] += 1
+                self._pos_neg_ratio_stats["rejected_raw_samples"] += raw_total_count
+                return
+            total_count = len(selected_indices)
+            selected_rewards = [reward_values[idx] for idx in selected_indices]
+            correct_count = sum(1 for reward in selected_rewards if reward > 0)
+            aggregated.non_tensor_batch["uid"] = np.array(
+                [f"uid_{prompt_uid}"] * len(aggregated), dtype=object
+            )
+            self._pos_neg_ratio_stats["accepted_prompts"] += 1
+            self._pos_neg_ratio_stats["accepted_samples"] += total_count
 
         reject_reason = ""
         if self.rejection_sampling_enabled and total_count >= 2:
@@ -1529,7 +2031,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             rollout_status=await self.get_statistics(),
             prompt_uid=prompt_uid,
             sampling_prob=state.sampling_prob,
-            rollout_n=state.num_finished,
+            rollout_n=total_count,
+            positive_count=correct_count,
+            stop_reason=stop_reason,
+            raw_rollout_n=raw_total_count,
+            raw_positive_count=raw_correct_count,
+            pos_neg_target_positive=self.target_positive_count,
+            pos_neg_target_negative=self.target_negative_count,
+            pos_neg_ratio_applied=self.pos_neg_ratio_enabled,
+            compensation_applied=bool(getattr(state, "compensation_granted", False)),
+            compensation_samples=int(getattr(state, "compensation_samples", 0)),
+            compensation_saved_budget=int(getattr(state, "saved_budget", 0)),
+            compensation_base_n=int(getattr(state, "base_target_n", -1) or -1),
+            compensation_initial_n=int(getattr(state, "initial_target_n", -1) or -1),
+            compensation_roi=float(getattr(state, "compensation_roi", 0.0)),
+            compensation_success_prob=float(getattr(state, "compensation_success_prob", 0.0)),
+            compensation_state=str(getattr(state, "compensation_state", "")),
         )
 
         # Attach prompt_buffer metadata (pass_rate / count) after on_sample_end updates.
@@ -1542,15 +2059,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
-            n_samples=int(state.num_finished),
+            n_samples=int(total_count),
             start_version=int(state.start_param_version),
         )
         if success:
             self.total_generated_prompts += 1
-            self.total_generated_samples += int(state.num_finished)
+            self.total_generated_samples += int(total_count)
         else:
             self.dropped_prompts += 1
-            self.dropped_samples += int(state.num_finished)
+            self.dropped_samples += int(total_count)
 
     async def consume_rejection_stats(self) -> dict:
         """Drain and return the accumulated rejection-sampling stats + reward info.

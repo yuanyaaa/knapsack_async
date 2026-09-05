@@ -51,4 +51,45 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+
+    # Ray actors do not reliably inherit environment variables exported only in
+    # the job entrypoint shell. Propagate user-selected tracking credentials via
+    # runtime_env so remote trainer actors do not fall back to platform defaults.
+    # TRITON_CACHE_DIR is propagated for the same reason as VLLM_DISABLE_COMPILE_CACHE
+    # above: concurrent jobs compiling into one shared Triton cache can leave a
+    # corrupted entry, after which every vLLM worker dies with
+    # "AttributeError: 'list' object has no attribute 'items'" in triton's cache
+    # manager. Giving a job its own cache dir keeps the failure from recurring.
+    for key in (
+        "USER_SWANLAB_API_KEY",
+        "SWANLAB_WORKSPACE",
+        "SWANLAB_LOG_DIR",
+        "SWANLAB_MODE",
+        "SWANLAB_HOST",
+        "SWANLAB_API_HOST",
+        "SWANLAB_WEB_HOST",
+        "SWANLAB_INIT_TIMEOUT_SECONDS",
+        "TRITON_CACHE_DIR",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
+
+    # Ray actors may run on a node whose raylet was started from a different
+    # login shell. Explicitly forward proxy settings instead of relying on
+    # per-node shell configuration. This is required for services such as the
+    # internal SwanLab endpoint, whose login otherwise can block indefinitely
+    # on nodes without the caller's HTTP(S) proxy.
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

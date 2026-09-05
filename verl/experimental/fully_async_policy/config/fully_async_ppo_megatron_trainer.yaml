@@ -51,6 +51,9 @@ async_training:
     adaptive_rollout_n_strategy: null
     # Lower clamp on adaptive rollout_n; upper clamp is ``max_rollout_n`` above.
     min_rollout_n: 2
+    rollout_chunk_size: 2
+    # Optional positive:negative composition control for emitted has-k groups.
+    positive_negative_ratio: null
     train_trigger: "fixed_prompt"         # fixed_prompt | fixed_samples
     # null -> default = required_samples (= ppo_mini_batch_size * rollout.n * require_batches)
     target_samples: null
