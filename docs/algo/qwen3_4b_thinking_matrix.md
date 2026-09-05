@@ -18,6 +18,12 @@ the 16K training boundary. Responses with at least 16,384 tokens count as incorr
 All-correct prompts and prompts with more than one of eight responses reaching 16K are removed.
 All-wrong prompts are retained, and the offline prior is clipped to `[0.01, 0.99]`.
 
+Reproduce the source evaluation on an existing 2-node/16-GPU Ray cluster with:
+
+```bash
+bash scripts/submit_qwen3_4b_thinking_evaluate_dapo17k_n8_32k_zwfy8.sh
+```
+
 ## Arms
 
 Each arm uses one 8-GPU rollout node and one 8-GPU trainer node.
