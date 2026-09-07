@@ -12,6 +12,8 @@ All paths below are on the shared `zwfy8` filesystem.
   `/apdcephfs_zwfy8/share_303922427/pencywang/data/qwen3_4b_thinking/q3_4b_thinking_official_dapo17k_n8_32k_0904_1514_samples.jsonl`
 - Training data (11,001 prompts):
   `/apdcephfs_zwfy8/share_303922427/pencywang/data/qwen3_4b_thinking/dapo17k_qwen3_4b_thinking_n8_gen32k_trunc16k_train_clip001_099_drop_allcorrect_overlong0125.parquet`
+- Training-time evaluation sets (AIME24/25, AMC, MATH, Minerva, OlympiadBench, GPQA):
+  `data/eval/deepscaler/` in this repository
 
 The training data was derived from the 32K thinking generations by recomputing rewards at
 the 16K training boundary. Responses with at least 16,384 tokens count as incorrect.

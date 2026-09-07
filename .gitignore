@@ -123,6 +123,7 @@ ENV/
 
 # data
 *.parquet
+!data/eval/deepscaler/*.parquet
 
 
 # local logs

@@ -8,7 +8,7 @@ ROOT=/apdcephfs_zwfy8/share_303922427/pencywang/project/knapsack_async
 ZW_ROOT=/apdcephfs_zwfy8/share_303922427/pencywang
 MODEL_PATH="${ZW_ROOT}/models/Qwen3-4B"
 TRAIN_FILE="${ZW_ROOT}/data/qwen3_4b_thinking/dapo17k_qwen3_4b_thinking_n8_gen32k_trunc16k_train_clip001_099_drop_allcorrect_overlong0125.parquet"
-VAL_ROOT="${ZW_ROOT}/project/data_parquet/deepscaler"
+VAL_ROOT="${EVAL_DATA_ROOT:-${ROOT}/data/eval/deepscaler}"
 CKPTS_ROOT="${ZW_ROOT}/ckpts/knapsack_async_qwen3_4b_thinking"
 DATE_TAG="${DATE_TAG:-$(date +%m%d_%H%M)}"
 
