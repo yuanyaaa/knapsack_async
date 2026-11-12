@@ -62,6 +62,13 @@ async_training:
   # Random seed for prompt buffer sampling reproducibility.
   prompt_buffer_seed: 42
 
+  # Leading sampling epochs drawn with shuffle_sequential before sample_strategy takes
+  # over. Under stop_rule=offline_medium_focus_budget_compensate, prompts drawn during
+  # warmup also use the fixed rollout.n and are never compensated.
+  warmup_epochs: 0
+  # False ignores extra_info.pass_rate, so pass rates are learned online only.
+  use_dataset_pass_rate: true
+
   # ==================== Rollout Config (streaming per-sequence) ====================
   # Async rollout is always streaming per-sequence: submit sequence generation jobs
   # ONE AT A TIME per prompt_uid, then decide (after each job returns) whether to
@@ -126,7 +133,25 @@ async_training:
     #                       ablation switch).
     # Users can register additional strategies via the @register_adaptive_n
     # decorator.
+    #   vip                 VIP baseline (arXiv:2602.01601): GP success-rate
+    #                       prediction + per-block variance-minimizing budget
+    #                       allocation, see utils/vip_allocation.py. Bounds are
+    #                       [min_rollout_n, max_rollout_n].
     adaptive_rollout_n_strategy: null
+
+    # VIP-only knobs (adaptive_rollout_n_strategy=vip).
+    # .npz with ``uids``, ``embeddings`` and ``median_dist`` per prompt_uid.
+    vip_embedding_path: null
+    # Prompts per allocation block; 0 -> ppo_mini_batch_size * require_batches.
+    vip_block_size: 0
+    # Average rollouts per prompt, i.e. block budget C / B; 0 -> rollout.n.
+    vip_budget_per_prompt: 0
+    # RBF bandwidth; <= 0 -> median pairwise embedding distance.
+    vip_length_scale: 0.0
+    vip_eps: 1.0e-6
+    vip_jitter: 1.0e-4
+    # dr_grpo: Var ∝ (n-1)/n^2 * p(1-p); rloo: Var ∝ p(1-p)/(n-1).
+    vip_variance: dr_grpo
 
     # For stop_rule=adaptive_chunk_mixed:
     #   w = min(1, k / adaptive_chunk_prior_tau)

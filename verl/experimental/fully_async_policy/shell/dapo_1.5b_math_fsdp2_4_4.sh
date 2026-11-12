@@ -10,6 +10,8 @@ set -euo pipefail
 sample_strategy="${SAMPLE_STRATEGY:-shuffle_sequential}"
 trainer_logger="${TRAINER_LOGGER:-['console','swanlab']}"
 reward_ema="${REWARD_EMA:-0.1}"
+warmup_epochs="${WARMUP_EPOCHS:-0}"
+use_dataset_pass_rate="${USE_DATASET_PASS_RATE:-True}"
 uniform_extreme_alpha="${UNIFORM_EXTREME_ALPHA:-0.2}"
 uniform_ucb_c="${UNIFORM_UCB_C:-0.0}"
 adaptive_rollout_n_strategy="${ADAPTIVE_ROLLOUT_N_STRATEGY:-}"
@@ -17,6 +19,13 @@ adaptive_chunk_alpha="${ADAPTIVE_CHUNK_ALPHA:-0.5}"
 adaptive_mixed_target_prob="${ADAPTIVE_MIXED_TARGET_PROB:-0.85}"
 adaptive_chunk_prior_tau="${ADAPTIVE_CHUNK_PRIOR_TAU:-8.0}"
 adaptive_chunk_target_strategy="${ADAPTIVE_CHUNK_TARGET_STRATEGY:-medium_focus_plateau}"
+# VIP baseline (ADAPTIVE_ROLLOUT_N_STRATEGY=vip, STOP_RULE=fixed_rollout).
+vip_embedding_path="${VIP_EMBEDDING_PATH:-null}"
+vip_block_size="${VIP_BLOCK_SIZE:-0}"
+vip_budget_per_prompt="${VIP_BUDGET_PER_PROMPT:-0}"
+vip_length_scale="${VIP_LENGTH_SCALE:-0.0}"
+vip_eps="${VIP_EPS:-1.0e-6}"
+vip_variance="${VIP_VARIANCE:-dr_grpo}"
 compensation_bank_max="${COMPENSATION_BANK_MAX:-8}"
 compensation_chunk_size="${COMPENSATION_CHUNK_SIZE:-1}"
 compensation_save_n="${COMPENSATION_SAVE_N:-4}"
@@ -450,6 +459,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.sample_strategy=${sample_strategy_hydra} \
     async_training.reward_ema="${reward_ema}" \
+    async_training.warmup_epochs="${warmup_epochs}" \
+    async_training.use_dataset_pass_rate="${use_dataset_pass_rate}" \
     async_training.uniform_extreme_alpha="${uniform_extreme_alpha}" \
     async_training.uniform_ucb_c="${uniform_ucb_c}" \
     async_training.rollout_config.stop_rule="${stop_rule}" \
@@ -460,6 +471,12 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.rollout_config.rollout_chunk_size="${ROLLOUT_CHUNK_SIZE:-2}" \
     async_training.rollout_config.positive_negative_ratio="${pos_neg_ratio}" \
     async_training.rollout_config.adaptive_rollout_n_strategy="${adaptive_rollout_n_strategy}" \
+    async_training.rollout_config.vip_embedding_path="${vip_embedding_path}" \
+    async_training.rollout_config.vip_block_size="${vip_block_size}" \
+    async_training.rollout_config.vip_budget_per_prompt="${vip_budget_per_prompt}" \
+    async_training.rollout_config.vip_length_scale="${vip_length_scale}" \
+    async_training.rollout_config.vip_eps="${vip_eps}" \
+    async_training.rollout_config.vip_variance="${vip_variance}" \
     async_training.rollout_config.adaptive_chunk_alpha="${adaptive_chunk_alpha}" \
     async_training.rollout_config.adaptive_mixed_target_prob="${adaptive_mixed_target_prob}" \
     async_training.rollout_config.adaptive_chunk_prior_tau="${adaptive_chunk_prior_tau}" \

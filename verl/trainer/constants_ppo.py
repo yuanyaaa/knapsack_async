@@ -62,6 +62,7 @@ def get_ppo_ray_runtime_env():
     # manager. Giving a job its own cache dir keeps the failure from recurring.
     for key in (
         "USER_SWANLAB_API_KEY",
+        "SWANLAB_API_KEY",
         "SWANLAB_WORKSPACE",
         "SWANLAB_LOG_DIR",
         "SWANLAB_MODE",

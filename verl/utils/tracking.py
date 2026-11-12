@@ -168,10 +168,13 @@ class Tracking:
                     "save": False,
                 }
                 login_params = inspect.signature(swanlab.login).parameters
+                accepts_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in login_params.values()
+                )
                 login_kwargs = {
                     key: value
                     for key, value in login_kwargs.items()
-                    if key in login_params and (value is not None or key == "api_key")
+                    if (accepts_kwargs or key in login_params) and (value is not None or key == "api_key")
                 }
                 has_proxy = any(
                     os.environ.get(key)

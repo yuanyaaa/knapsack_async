@@ -452,6 +452,10 @@ class AsyncPromptBuffer:
         pass_rate_clip_max: Upper bound to clip updated pass_rate. Defaults to 1.0 (no clip).
         uniform_extreme_alpha: Downweight factor for p=0/p=1 under ``uniform_extreme_ucb``.
         uniform_ucb_c: Strength of UCB-style exploration multiplier under ``uniform_extreme_ucb``.
+        warmup_epochs: Number of leading sampling epochs drawn with ``shuffle_sequential``
+            regardless of ``sample_strategy``; ``sample_strategy`` takes over afterwards.
+        use_dataset_pass_rate: If False, ignore ``extra_info.pass_rate`` so every prompt's
+            pass_rate starts unknown and is learned online.
     """
 
     def __init__(
@@ -465,10 +469,16 @@ class AsyncPromptBuffer:
         pass_rate_clip_max: float = 1.0,
         uniform_extreme_alpha: float = 0.2,
         uniform_ucb_c: float = 0.0,
+        warmup_epochs: int = 0,
+        use_dataset_pass_rate: bool = True,
     ):
         self.dataset = dataset
         self.collate_fn = collate_fn
         self.seed = seed
+        self.warmup_epochs = max(0, int(warmup_epochs))
+        self.use_dataset_pass_rate = bool(use_dataset_pass_rate)
+        self._warmup_finished_logged = self.warmup_epochs == 0
+        self._warmup_drawn: dict[str, int] = {}
 
         # Initialize generator for reproducible sampling
         self.generator = torch.Generator()
@@ -643,10 +653,52 @@ class AsyncPromptBuffer:
             self._sync_row_weights()
         elif self._sample_mode == "shuffle_sequential":
             self._reshuffle_sequential_order()
+        if self.warmup_epochs > 0 and self._sample_mode != "shuffle_sequential":
+            self._reshuffle_sequential_order()
 
         print(
             f"[AsyncPromptBuffer] Initialized with {len(dataset)} samples, "
-            f"{len(self.meta_data)} unique prompt_uids"
+            f"{len(self.meta_data)} unique prompt_uids, warmup_epochs={self.warmup_epochs} "
+            f"(shuffle_sequential), use_dataset_pass_rate={self.use_dataset_pass_rate}"
+        )
+
+    def in_warmup(self) -> bool:
+        """True while the leading ``warmup_epochs`` sampling epochs are being drawn."""
+        return self._sampling_epoch_index < self.warmup_epochs
+
+    def consume_warmup_draw(self, prompt_uid: str) -> bool:
+        """True (once per draw) if ``prompt_uid`` was drawn during warmup."""
+        pending = self._warmup_drawn.get(prompt_uid, 0)
+        if pending <= 0:
+            return False
+        if pending == 1:
+            del self._warmup_drawn[prompt_uid]
+        else:
+            self._warmup_drawn[prompt_uid] = pending - 1
+        return True
+
+    def _on_warmup_finished(self) -> None:
+        """Hand over to ``sample_strategy`` using the pass rates learned during warmup."""
+        self._warmup_finished_logged = True
+        unobserved = 0
+        if self._sample_mode != "shuffle_sequential":
+            self._sync_row_weights()
+        if self.use_priority:
+            # Prompts still in flight from warmup have no pass_rate yet; weight them as p=0.5
+            # without writing a fake observation into the EMA.
+            unobserved_weight = self._priority_weight_fn(0.5)
+            for meta in self.meta_data.values():
+                if "pass_rate" not in meta:
+                    unobserved += 1
+                    for row_idx in meta.get("row_indices", []):
+                        self.row_weights[row_idx] = unobserved_weight
+        rates = [float(m["pass_rate"]) for m in self.meta_data.values() if "pass_rate" in m]
+        print(
+            f"[AsyncPromptBuffer][Warmup] finished after {self.warmup_epochs} epoch(s); switching to "
+            f"sample_strategy={self.sample_strategy}. prompts_with_pass_rate={len(rates)}/{len(self.meta_data)}, "
+            f"unobserved_weighted_as_0.5={unobserved}, mean_pass_rate={np.mean(rates) if rates else float('nan'):.4f}, "
+            f"zero_frac={np.mean([r == 0.0 for r in rates]) if rates else float('nan'):.4f}",
+            flush=True,
         )
 
     def get_single_sample(self) -> tuple[dict, str, float]:
@@ -661,7 +713,12 @@ class AsyncPromptBuffer:
         eps = 0.001
         n = len(self.dataset)
 
-        if self._sample_mode == "shuffle_sequential":
+        warmup = self.in_warmup()
+        if not warmup and not self._warmup_finished_logged:
+            self._on_warmup_finished()
+        mode = "shuffle_sequential" if warmup else self._sample_mode
+
+        if mode == "shuffle_sequential":
             if n > 0:
                 position = self._seq_cursor % n
                 if len(self._shuffle_sequential_order) != n:
@@ -674,7 +731,7 @@ class AsyncPromptBuffer:
             else:
                 idx = 0
                 sampling_prob = 0.0
-        elif self._sample_mode == "sequential":
+        elif mode == "sequential":
             if n > 0:
                 idx = self._seq_cursor % n
                 self._seq_cursor += 1
@@ -682,7 +739,7 @@ class AsyncPromptBuffer:
             else:
                 idx = 0
                 sampling_prob = 0.0
-        elif self._sample_mode == "weight_sequential":
+        elif mode == "weight_sequential":
             if n > 0 and self._weight_sequential_order:
                 order_len = len(self._weight_sequential_order)
                 pos = self._seq_cursor % order_len
@@ -695,7 +752,7 @@ class AsyncPromptBuffer:
             else:
                 idx = 0
                 sampling_prob = 0.0
-        elif self._sample_mode == "uniform":
+        elif mode == "uniform":
             idx = torch.randint(0, n, (1,), generator=self.generator).item() if n > 0 else 0
             sampling_prob = 1.0 / n if n > 0 else 0.0
         else:
@@ -723,13 +780,15 @@ class AsyncPromptBuffer:
         sample["prompt_uid"] = prompt_uid
         sample["pass_rate"] = self.meta_data.get(prompt_uid, {}).get("pass_rate", 0.5)
 
+        if warmup:
+            self._warmup_drawn[prompt_uid] = self._warmup_drawn.get(prompt_uid, 0) + 1
         self._record_sampling_epoch_draw(idx, prompt_uid)
 
         trace(
             CHANNEL_PRIORITY,
             "draw",
             uid=prompt_uid,
-            mode=self._sample_mode,
+            mode=mode,
             row=idx,
             p=sample["pass_rate"],
             sampling_prob=sampling_prob,
@@ -808,6 +867,7 @@ class AsyncPromptBuffer:
             "prompt_buffer/unique_seen_ratio": num_seen / num_total if num_total > 0 else 0.0,
             "prompt_buffer/zero_count_ratio": num_zero_count / num_total if num_total > 0 else 0.0,
             "prompt_buffer/zero_count_number": num_zero_count,
+            "prompt_buffer/warmup_active": float(self.in_warmup()),
         }
         info.update(self._sampling_epoch_info())
 
@@ -1074,7 +1134,7 @@ class AsyncPromptBuffer:
 
             if isinstance(extra_info, dict):
                 prompt_uid = str(extra_info.get("prompt_uid", i))
-                pr = extra_info.get("pass_rate")
+                pr = extra_info.get("pass_rate") if self.use_dataset_pass_rate else None
                 if pr is not None and not (isinstance(pr, float) and np.isnan(pr)):
                     if prompt_uid not in self.meta_data:
                         self.meta_data[prompt_uid] = {}

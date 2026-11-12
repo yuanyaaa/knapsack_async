@@ -137,6 +137,8 @@ class PromptState:
     compensation_roi: float = 0.0
     compensation_success_prob: float = 0.0
     budget_record_id: Optional[int] = None
+    # Drawn during the prompt-buffer warmup: fixed N, no budget record, no compensation.
+    warmup: bool = False
 
     @property
     def num_finished(self) -> int:
@@ -208,6 +210,7 @@ class AsyncResponseBuffer:
         dynamic_fixed_n_provider: Optional[Callable[[str], int]] = None,
         prompt_pass_rate_provider: Optional[Callable[[str], float]] = None,
         min_rollout_n_provider: Optional[Callable[[], int]] = None,
+        warmup_prompt_provider: Optional[Callable[[str], bool]] = None,
     ):
         if stop_rule not in _VALID_STOP_RULES:
             raise ValueError(
@@ -336,6 +339,8 @@ class AsyncResponseBuffer:
         self.dynamic_fixed_n_provider = dynamic_fixed_n_provider
         self.prompt_pass_rate_provider = prompt_pass_rate_provider
         self.min_rollout_n_provider = min_rollout_n_provider
+        self.warmup_prompt_provider = warmup_prompt_provider
+        self.warmup_prompts = 0
 
         # prompt_uid -> PromptState
         self._states: dict[str, PromptState] = {}
@@ -678,6 +683,15 @@ class AsyncResponseBuffer:
         if state.initial_target_n is not None:
             return int(state.initial_target_n)
 
+        if self.warmup_prompt_provider is not None and self.warmup_prompt_provider(prompt_uid):
+            init_n = int(self.fixed_rollout_n)
+            state.warmup = True
+            state.base_target_n = init_n
+            state.initial_target_n = init_n
+            state.target_n = init_n
+            self.warmup_prompts += 1
+            return init_n
+
         if self.dynamic_fixed_n_provider is not None:
             init_n = self._resolve_fixed_n(prompt_uid)
         else:
@@ -939,7 +953,7 @@ class AsyncResponseBuffer:
 
     def _maybe_grant_budget_compensation(self, prompt_uid: str, state: PromptState) -> bool:
         """Grant a one-shot compensation to a homogeneous group under the window budget."""
-        if state.compensated or state.compensation_granted:
+        if state.warmup or state.compensated or state.compensation_granted:
             return False
         if state.num_finished <= 0 or state.num_finished >= self.max_rollout_n:
             return False
@@ -1394,6 +1408,7 @@ class AsyncResponseBuffer:
             "response_buffer/pending_samples": self.num_pending_samples(),
             "response_buffer/in_flight_samples": total_in_flight,
             "response_buffer/live_finished_samples": total_finished,
+            "compensation/warmup_prompts_total": int(self.warmup_prompts),
             "compensation/bank_current": int(self.compensation_budget_bank),
             "compensation/bank_max": int(self.compensation_bank_max),
             "compensation/bank_deposited_prompts_total": int(self.compensation_stats["bank_deposited_prompts"]),

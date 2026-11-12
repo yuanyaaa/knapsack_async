@@ -41,6 +41,7 @@ from verl.experimental.fully_async_policy.utils.async_response_buffer import (
     TRAIN_TRIGGER_FIXED_SAMPLES,
     AsyncResponseBuffer,
 )
+from verl.experimental.fully_async_policy.utils.vip_allocation import VIPRolloutAllocator
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     ValidateMetrics,
@@ -176,6 +177,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             pass_rate_clip_max=async_training_cfg.get("pass_rate_clip_max", 0.99),
             uniform_extreme_alpha=async_training_cfg.get("uniform_extreme_alpha", 0.2),
             uniform_ucb_c=async_training_cfg.get("uniform_ucb_c", 0.0),
+            warmup_epochs=int(async_training_cfg.get("warmup_epochs", 0) or 0),
+            use_dataset_pass_rate=bool(async_training_cfg.get("use_dataset_pass_rate", True)),
         )
         print("[FullyAsyncRollouter] AsyncPromptBuffer created successfully")
 
@@ -388,7 +391,39 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             stop_rule == "offline_medium_focus_budget_compensate"
             and _strategy == "medium_focus"
         )
-        if _strategy and stop_rule in adaptive_fixed_n_stop_rules and not use_buffer_medium_focus:
+        # VIP allocates a shared budget over a block of prompts, so it bypasses
+        # the per-prompt strategy registry; see ``_next_prompt_sample``.
+        self.vip_allocator: VIPRolloutAllocator | None = None
+        self._vip_queue: list = []
+        self._vip_block_size = 0
+        if _strategy == "vip":
+            if stop_rule != "fixed_rollout":
+                raise ValueError(f"adaptive_rollout_n_strategy='vip' requires stop_rule='fixed_rollout', got '{stop_rule}'")
+            _vip_path = rollout_cfg.get("vip_embedding_path", None)
+            if not _vip_path:
+                raise ValueError("adaptive_rollout_n_strategy='vip' requires rollout_config.vip_embedding_path")
+            self._vip_block_size = int(rollout_cfg.get("vip_block_size", 0) or 0) or int(self.required_prompts)
+            self.vip_allocator = VIPRolloutAllocator(
+                embedding_path=str(_vip_path),
+                prior_pass_rates={
+                    uid: meta.get("pass_rate") for uid, meta in self.prompt_buffer.meta_data.items()
+                },
+                budget_per_prompt=int(rollout_cfg.get("vip_budget_per_prompt", 0) or 0) or _base_n,
+                min_n=_base_min_rollout_n,
+                max_n=_hard_max_n,
+                length_scale=float(rollout_cfg.get("vip_length_scale", 0.0) or 0.0),
+                eps=float(rollout_cfg.get("vip_eps", 1e-6)),
+                jitter=float(rollout_cfg.get("vip_jitter", 1e-4)),
+                variance=str(rollout_cfg.get("vip_variance", "dr_grpo")),
+            )
+
+            def _vip_fixed_n(prompt_uid: str, _base=_base_n) -> int:
+                target = self.vip_allocator.target_n(prompt_uid)
+                return int(target) if target is not None else int(_base)
+
+            dynamic_provider = _vip_fixed_n
+            print(f"[FullyAsyncRollouter] adaptive_rollout_n ENABLED: strategy='vip', block_size={self._vip_block_size}")
+        elif _strategy and stop_rule in adaptive_fixed_n_stop_rules and not use_buffer_medium_focus:
             _hard_min_n = _base_min_rollout_n
 
             def _dynamic_fixed_n(
@@ -478,6 +513,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             dynamic_fixed_n_provider=dynamic_provider,
             prompt_pass_rate_provider=_prompt_pass_rate,
             min_rollout_n_provider=_scheduled_min_rollout_n,
+            warmup_prompt_provider=(
+                self.prompt_buffer.consume_warmup_draw if self.prompt_buffer.warmup_epochs > 0 else None
+            ),
         )
         # Event used to signal the feed task that: (a) a prompt has just been
         # emitted (live-prompt count decreased, drain may be finished), or
@@ -1165,7 +1203,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Draw a fresh prompt from the AsyncPromptBuffer (prompt-side sampling).
             async with self.dataloader_lock:
                 self.prompt_buffer.set_training_step(self.current_param_version)
-                batch_dict, prompt_uid, sampling_prob = self.prompt_buffer.get_single_sample()
+                batch_dict, prompt_uid, sampling_prob = self._next_prompt_sample()
 
             # Avoid duplicate active prompt_uid (same uid rolled out concurrently would
             # confuse the response buffer). If a collision happens, just skip and retry.
@@ -1219,6 +1257,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             f"[FullyAsyncRollouter][Feed] All rollout tasks drained. "
             f"Total feed steps: {self.global_steps}"
         )
+
+    def _next_prompt_sample(self) -> tuple[dict, str, float]:
+        """Draw the next prompt; under VIP, prompts are drawn and allocated block by block."""
+        if self.vip_allocator is None:
+            return self.prompt_buffer.get_single_sample()
+        if not self._vip_queue:
+            block, seen = [], set()
+            for _ in range(4 * self._vip_block_size):
+                if len(block) >= self._vip_block_size:
+                    break
+                sample = self.prompt_buffer.get_single_sample()
+                if sample[1] in seen:
+                    continue
+                seen.add(sample[1])
+                block.append(sample)
+            self.vip_allocator.plan([uid for _, uid, _ in block])
+            self._vip_queue = block[::-1]
+        return self._vip_queue.pop()
 
     def _feed_gate_closed(self) -> bool:
         """Return True iff the prompt-level staleness gate is CLOSED and the
@@ -1419,6 +1475,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         }
 
         stats.update(self.response_buffer.stats())
+        if self.vip_allocator is not None:
+            stats.update(self.vip_allocator.stats())
         # Dataset-level prompt-buffer observability (e.g., cumulative unique seen prompts).
         stats.update({
             f"fully_async/{k}": v for k, v in self.prompt_buffer.get_dataset_info().items()
@@ -1808,6 +1866,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     final_state = self.response_buffer.get_state(prompt_uid)
                     if final_state is not None:
                         self.prompt_buffer.on_sample_end(prompt_uid, list(final_state.rewards))
+                        if self.vip_allocator is not None:
+                            self.vip_allocator.observe(prompt_uid, final_state.rewards)
                 except Exception as e:
                     print(f"[FullyAsyncRollouter] prompt_buffer.on_sample_end failed: {e}")
                 await self._emit_prompt_as_rollout_sample(prompt_uid)
